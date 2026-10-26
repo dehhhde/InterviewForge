@@ -1,0 +1,25 @@
+# 测试环境：所有 LLM 调用必须被 mock，不产生真实请求（见 §10.7）
+app:
+  name: InterviewForge-test
+  env: testing
+  log_level: WARNING
+  cors_origins: []
+
+llm:
+  request_timeout_seconds: 5
+  max_concurrency: 2
+  default_max_tokens: 256
+
+agent:
+  recursion_limit: 10
+  validate_max_retries: 1
+  max_tokens_per_run: 100000  # 替身用量极小，护栏在测试里只验"存在"，不验触发
+
+question:
+  total: 3
+  difficulty_ratio: {easy: 0.34, medium: 0.33, hard: 0.33}
+
+retrieval:
+  top_k_coarse: 5
+  top_k_final: 3
+  dedup_similarity_threshold: 0.85

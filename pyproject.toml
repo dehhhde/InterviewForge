@@ -1,0 +1,43 @@
+[project]
+name = "interview-forge"
+version = "0.1.0"
+description = "基于 LangGraph Agent 的简历解析与面试题生成系统"
+requires-python = ">=3.12"
+
+# 依赖按阶段引入，不要一次装完（见 LEARNING_ROADMAP.md §16）
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# alembic 生成的迁移里，列名 + 约束名会被拉成一整行；手改换行只会在下次 autogenerate
+# 时被覆盖掉。生成的代码不参与"我们自己的代码风格"这条线。
+"migrations/versions/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "error::DeprecationWarning",
+    # langgraph 1.2.15 内部仍调用 asyncio.iscoroutinefunction，Python 3.14 已弃用；
+    # 不是本项目可控的调用点，忽略以免整条图执行在测试里被判失败。
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/scripts/*"]

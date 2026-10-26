@@ -1,0 +1,356 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "InterviewForge · LangGraph 执行图 v2",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "D:/code/InterviewForge/docs/diagrams/interviewforge-langgraph-execution-graph.v2.html",
+    "views": [
+      {
+        "id": "happy_path",
+        "label": "一次成卷主路径",
+        "focus": [
+          "entry",
+          "parse",
+          "validate",
+          "match",
+          "profile",
+          "plan",
+          "generate",
+          "generate_item",
+          "review"
+        ],
+        "note": "从 POST /interviews/generate 到报告落库，正常只走这一条线。"
+      },
+      {
+        "id": "fallback",
+        "label": "唯一回退边",
+        "focus": [
+          "parse",
+          "validate"
+        ],
+        "note": "validate 判出问题才回到 parse，计数由 validate 自增，所以比较用 <=。"
+      },
+      {
+        "id": "fanout",
+        "label": "Send 扇出与收尾",
+        "focus": [
+          "plan",
+          "generate",
+          "generate_item",
+          "review"
+        ],
+        "note": "一条 plan_item 一个分支，分支只看到 GenerateJob；review 跑完直接落库。"
+      }
+    ],
+    "visual_preset": "blueprint"
+  },
+  "lanes": [
+    {
+      "id": "trigger",
+      "label": "入口与断点"
+    },
+    {
+      "id": "pipeline",
+      "label": "LangGraph 主干"
+    },
+    {
+      "id": "gate",
+      "label": "回退门",
+      "variant": "exception"
+    },
+    {
+      "id": "fanout",
+      "label": "Send 扇出"
+    }
+  ],
+  "phases": [
+    {
+      "id": "phase_extract",
+      "label": "抽取与自洽校验",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "phase_reason",
+      "label": "对齐 · 画像 · 配额",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "phase_answer",
+      "label": "出题 · 评审 · 落库",
+      "fromCol": 4,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "mainPath": [
+    "entry",
+    "parse",
+    "validate",
+    "match",
+    "profile",
+    "plan",
+    "generate",
+    "generate_item",
+    "review"
+  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "entry"
+    ],
+    "allowedTerminals": [
+      "review",
+      "checkpoint"
+    ],
+    "requiredEdges": [
+      {
+        "from": "entry",
+        "to": "parse"
+      },
+      {
+        "from": "entry",
+        "to": "checkpoint"
+      },
+      {
+        "from": "parse",
+        "to": "validate"
+      },
+      {
+        "from": "validate",
+        "to": "parse"
+      },
+      {
+        "from": "validate",
+        "to": "match"
+      },
+      {
+        "from": "match",
+        "to": "profile"
+      },
+      {
+        "from": "profile",
+        "to": "plan"
+      },
+      {
+        "from": "plan",
+        "to": "generate"
+      },
+      {
+        "from": "generate",
+        "to": "generate_item"
+      },
+      {
+        "from": "generate_item",
+        "to": "review"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "entry",
+      "lane": "trigger",
+      "col": 0,
+      "type": "frontend",
+      "label": "POST /interviews/generate",
+      "sublabel": "建头 + 任务 → 202",
+      "tag": "BackgroundTasks",
+      "width": 180
+    },
+    {
+      "id": "checkpoint",
+      "lane": "trigger",
+      "col": 1,
+      "type": "database",
+      "label": "SqliteSaver",
+      "sublabel": "data/checkpoints.db",
+      "tag": "thread_id",
+      "width": 108
+    },
+    {
+      "id": "parse",
+      "lane": "pipeline",
+      "col": 0,
+      "type": "backend",
+      "label": "parse 解析",
+      "sublabel": "parsers → extractors",
+      "tag": "1× LLM · v1",
+      "width": 116
+    },
+    {
+      "id": "validate",
+      "lane": "gate",
+      "col": 1,
+      "type": "backend",
+      "label": "validate 校验",
+      "sublabel": "规则全过才问模型",
+      "tag": "validate@v1",
+      "width": 116
+    },
+    {
+      "id": "match",
+      "lane": "pipeline",
+      "col": 2,
+      "type": "backend",
+      "label": "match 匹配",
+      "sublabel": "词典对齐 + 软要求",
+      "tag": "match@v1",
+      "width": 116
+    },
+    {
+      "id": "profile",
+      "lane": "pipeline",
+      "col": 3,
+      "type": "backend",
+      "label": "profile 画像",
+      "sublabel": "rubric 打分 + 叙述",
+      "tag": "profile@v1",
+      "width": 116
+    },
+    {
+      "id": "plan",
+      "lane": "pipeline",
+      "col": 4,
+      "type": "backend",
+      "label": "plan 配额表",
+      "sublabel": "最大余数法铺题",
+      "tag": "纯算术",
+      "width": 116
+    },
+    {
+      "id": "generate",
+      "lane": "fanout",
+      "col": 4,
+      "type": "backend",
+      "label": "generate 扇出准备",
+      "sublabel": "预算检查 · 批次 +1 · 清空",
+      "tag": "generate@v1",
+      "width": 138
+    },
+    {
+      "id": "generate_item",
+      "lane": "fanout",
+      "col": 5,
+      "type": "messagebus",
+      "label": "generate_item × N",
+      "sublabel": "单槽位一次调用",
+      "tag": "generate@v1",
+      "width": 128
+    },
+    {
+      "id": "review",
+      "lane": "pipeline",
+      "col": 5,
+      "type": "security",
+      "label": "review 评审",
+      "sublabel": "规则 + 语义批注",
+      "tag": "review@v1",
+      "width": 116
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge_entry_parse",
+      "from": "entry",
+      "to": "parse",
+      "label": "初始 state",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "edge_entry_checkpoint",
+      "from": "entry",
+      "to": "checkpoint",
+      "label": "每超步 checkpoint",
+      "variant": "dashed",
+      "role": "async"
+    },
+    {
+      "id": "edge_parse_validate",
+      "from": "parse",
+      "to": "validate",
+      "label": "raw_text · parsed",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_validate_parse",
+      "from": "validate",
+      "to": "parse",
+      "label": "issues 且 retries ≤ 2",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "edge_validate_match",
+      "from": "validate",
+      "to": "match",
+      "label": "通过 / 预算用尽",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_match_profile",
+      "from": "match",
+      "to": "profile",
+      "label": "matched_gaps",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_profile_plan",
+      "from": "profile",
+      "to": "plan",
+      "label": "profile 通道",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_plan_generate",
+      "from": "plan",
+      "to": "generate",
+      "label": "plan.items",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "edge_generate_item",
+      "from": "generate",
+      "to": "generate_item",
+      "label": "Send × N",
+      "variant": "emphasis",
+      "role": "async"
+    },
+    {
+      "id": "edge_item_review",
+      "from": "generate_item",
+      "to": "review",
+      "label": "questions 累加",
+      "variant": "default",
+      "role": "main"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "契约与确定性",
+      "items": [
+        "节点只返回增量；trace / errors 只追加",
+        "prompt_version 由 traced() 剥离并记进 trace",
+        "parse 只花 1 次 LLM，plan 一次都不调"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "失败与成本边界",
+      "items": [
+        "可恢复失败写 errors / review_issues；不可恢复抛 AppError",
+        "扇出前读 llm.usage，越线抛 BudgetExceededError（429）",
+        "中途崩溃：mark_failed，interview 由 running 翻 aborted"
+      ]
+    }
+  ]
+}

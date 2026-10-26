@@ -1,0 +1,24 @@
+app:
+  name: InterviewForge
+  env: development
+  log_level: DEBUG
+  cors_origins: ["http://localhost:3000"]
+
+llm:
+  request_timeout_seconds: 60
+  max_concurrency: 4
+  default_max_tokens: 2048
+
+agent:
+  recursion_limit: 25
+  validate_max_retries: 2
+  max_tokens_per_run: 200000
+
+question:
+  total: 15
+  difficulty_ratio: {easy: 0.3, medium: 0.5, hard: 0.2}
+
+retrieval:
+  top_k_coarse: 20
+  top_k_final: 5
+  dedup_similarity_threshold: 0.85

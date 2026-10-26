@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InterviewForge · 简历解析与面试题生成</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">IF</span>
+    <div>
+      <h1>InterviewForge</h1>
+      <p>简历解析 → 面试题生成 · 七节点 LangGraph 工作流</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="health" class="badge badge-muted">检测连接中</span>
+    <select id="api-base" class="select" title="API 根地址">
+      <option value="/api/v1">同源 /api/v1</option>
+      <option value="http://127.0.0.1:8000/api/v1">http://127.0.0.1:8000/api/v1</option>
+    </select>
+  </div>
+</header>
+
+<!-- 只在 file:// 下出现（app.js 的 showOriginBanner 负责揭开）：
+     跨域被拦长得很像服务挂了，不写这一句人会一直去重启 uvicorn。 -->
+<div id="origin-warning" class="banner" hidden>
+  <strong>这个页面是用 file:// 直接打开的本地文件。</strong>
+  浏览器会拦掉跨域响应，所以即使服务正常处理了请求，页面也只会报"不可达 / 失败"——
+  而上传<strong>已经真的写进了库</strong>，看到"上传失败"再点一次，库里就多出一份简历。
+  请改用 <a id="origin-link" href="http://127.0.0.1:8000/">http://127.0.0.1:8000/</a> 打开控制台
+  （页面与 API 同源，不需要 CORS，也不用动右上角的 API 根地址）。
+</div>
+
+<nav class="tabs" id="tabs">
+  <button class="tab is-active" data-view="generate">生成面试题</button>
+  <button class="tab" data-view="resumes">简历库</button>
+  <button class="tab" data-view="reports">报告列表</button>
+  <button class="tab" data-view="jobs">岗位</button>
+</nav>
+
+<main>
+  <!-- 生成 -->
+  <section class="view is-active" id="view-generate">
+    <div class="card">
+      <h2>发起一次出题</h2>
+      <div class="form-grid">
+        <label>简历
+          <select id="gen-resume" class="select"></select>
+        </label>
+        <label>岗位
+          <select id="gen-job" class="select"></select>
+        </label>
+        <div class="form-actions">
+          <button id="btn-generate" class="btn btn-primary">开始生成</button>
+          <span id="gen-hint" class="hint"></span>
+        </div>
+      </div>
+      <p class="hint">出题会跑完整张图（parse → validate → match → profile → plan → generate → review），
+      实测 80 秒上下；期间页面每 2 秒轮询一次 <code>GET /tasks/{task_id}</code>。</p>
+    </div>
+    <div class="split">
+      <div class="card" id="progress-panel" hidden>
+        <h2>任务进度</h2>
+        <div class="kv"><span>task_id</span><code id="prog-task"></code></div>
+        <div class="kv"><span>状态</span><span id="prog-status"></span></div>
+        <ol class="steps" id="prog-steps"></ol>
+        <div id="prog-result" class="result-block" hidden>
+          <h3>任务回执</h3>
+          <pre id="prog-result-json"></pre>
+        </div>
+        <div id="prog-error" class="error-block" hidden>
+          <h3>失败原因</h3>
+          <pre id="prog-error-json"></pre>
+        </div>
+      </div>
+      <div class="card" id="report-panel" hidden>
+        <div class="report-head">
+          <h2 id="report-title">报告</h2>
+          <div class="report-meta" id="report-meta"></div>
+          <div class="form-actions">
+            <button id="btn-export" class="btn">导出 Markdown</button>
+            <button id="btn-print" class="btn">打印</button>
+          </div>
+        </div>
+        <div class="report-body" id="report-body"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 简历库 -->
+  <section class="view" id="view-resumes">
+    <div class="card">
+      <h2>上传简历</h2>
+      <div class="form-grid">
+        <label>PDF / DOCX 文件
+          <input class="file" type="file" id="upload-file" accept=".pdf,.docx,.doc">
+        </label>
+        <div class="form-actions">
+          <button id="btn-upload" class="btn btn-primary">上传并解析</button>
+          <span id="upload-hint" class="hint"></span>
+        </div>
+      </div>
+      <p class="hint">上传立即返回 <code>202</code> 与两个 id，解析在同一个进程的后台协程里跑。</p>
+      <div id="upload-task" class="result-block" hidden>
+        <h3>解析进度</h3>
+        <ol class="steps" id="upload-steps"></ol>
+      </div>
+    </div>
+    <div class="split">
+      <div class="card">
+        <h2>简历 <span class="count" id="resume-count"></span></h2>
+        <p class="hint">每行右侧可改名（只动展示名，<code>raw_text</code> / <code>parsed</code> 不开写入口——
+        它们是证据链的真相源）或删除。删除会连报告一起带走（<code>ON DELETE CASCADE</code>），
+        名下有报告时接口先返 409，页面二次确认后才带 <code>force=true</code> 重试。</p>
+        <ul class="list" id="resume-list"></ul>
+      </div>
+      <div class="card" id="resume-detail" hidden>
+        <h2>抽取结果</h2>
+        <div id="resume-detail-body"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 报告列表 -->
+  <section class="view" id="view-reports">
+    <div class="card">
+      <h2>历史报告 <span class="count" id="report-count"></span></h2>
+      <p class="hint">每行标的"简历 × 岗位"来自 <code>interview</code> 表里的<strong>快照列</strong>
+      （<code>resume_name</code> / <code>job_title</code> / <code>job_company</code>），写入发生在生成那一刻：
+      之后简历改名、岗位下线都不改历史事实。黄色徽章标的是<strong>评审批注条数</strong>：
+      <em>已中止</em> 且题数为 0 只意味着后台任务没跑到收尾（上游报错或成本护栏触发），
+      不再代表"质量门把整批判死"——批注从 ADR-0015 起只标出该改的题，题目一律照常落库。</p>
+      <ul class="list" id="report-list"></ul>
+    </div>
+    <div class="card" id="report-panel-list" hidden>
+      <div class="report-head">
+        <h2 id="report-title-list">报告</h2>
+        <div class="report-meta" id="report-meta-list"></div>
+      </div>
+      <div class="report-body" id="report-body-list"></div>
+    </div>
+  </section>
+
+  <!-- 岗位 -->
+  <section class="view" id="view-jobs">
+    <div class="card">
+      <h2 id="job-form-title">新建岗位</h2>
+      <div class="form-grid">
+        <label>岗位名称
+          <input class="input" type="text" id="job-title" maxlength="200" placeholder="后端工程师">
+        </label>
+        <label>公司（可留空）
+          <input class="input" type="text" id="job-company" maxlength="200" placeholder="示例公司">
+        </label>
+        <label>期望年限
+          <input class="input" type="number" id="job-min-years" min="0" max="60" step="0.5" value="0">
+        </label>
+        <label>JD 正文
+          <textarea class="input input-wide" id="job-text" rows="8"
+            placeholder="岗位职责：&#10;1. 负责高并发 API 网关；&#10;任职要求：&#10;精通 Python，熟悉 Redis"></textarea>
+        </label>
+        <div class="form-actions">
+          <button id="btn-job-save" class="btn btn-primary">保存</button>
+          <button id="btn-job-cancel" class="btn" hidden>取消编辑</button>
+          <span id="job-hint" class="hint"></span>
+        </div>
+      </div>
+      <div class="form-grid">
+        <label>或从文件导入（.txt / .md / .pdf / .docx）
+          <input class="file" type="file" id="job-file" accept=".txt,.md,.pdf,.docx">
+        </label>
+        <div class="form-actions">
+          <button id="btn-job-upload" class="btn">上传 JD 文件</button>
+          <span id="job-upload-hint" class="hint"></span>
+        </div>
+      </div>
+      <div class="form-grid">
+        <label>或从图片识别（招聘海报 / 截图：.jpg .jpeg .png .webp .bmp .tif）
+          <input class="file" type="file" id="job-image-file"
+            accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff">
+        </label>
+        <div class="form-actions">
+          <button id="btn-job-inspect" class="btn">识别并填充表单</button>
+          <span id="job-image-hint" class="hint"></span>
+        </div>
+      </div>
+      <p class="hint">岗位写入是<strong>同步</strong>的：JD 里的技能由 <code>SKILL_ALIASES</code> 词典当场认出
+      （与 <code>match</code> 同一本词典），一次模型调用都不花，所以没有 task_id、不用轮询。
+      <code>required_skills</code> 留空即派生，写进表单则以你给的为准。</p>
+      <p class="hint">图片那条路要问模型（读图 1 次 + 补字段至多 1 次），等的是<strong>一份草稿</strong>：
+      认出来的字段灌进上面这张表单，认不出的留空，<strong>岗位名称</strong>是必填项、没认出来会点名要你补。
+      点保存才落库，走的还是 <code>POST /jobs</code> 那一条路。</p>
+    </div>
+    <div class="card">
+      <h2>岗位库 <span class="count" id="job-count"></span></h2>
+      <p class="hint">点一行可改；删除不会带走历史报告——<code>interview.job_id</code> 是
+      <code>ON DELETE SET NULL</code>，报告头里另存了生成当时的岗位名快照。</p>
+      <ul class="list list-cards" id="job-list"></ul>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>InterviewForge · FastAPI + LangGraph + SQLite</span>
+  <span id="foot-error" class="foot-error"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

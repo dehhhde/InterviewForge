@@ -1,0 +1,66 @@
+{
+  "name": "陈昊",
+  "email": "chen.hao@example.com",
+  "phone": "+86 138-0013-8000",
+  "years_experience": 4.5,
+  "skills": [
+    {
+      "name": "Java",
+      "level": "精通",
+      "years": 4.0,
+      "evidence": "熟练掌握 Java，四年生产经验"
+    },
+    {
+      "name": "Redis",
+      "level": "熟悉",
+      "years": 2.0,
+      "evidence": "负责 Redis 缓存方案设计"
+    },
+    {
+      "name": "Kubernetes",
+      "level": null,
+      "years": null,
+      "evidence": "了解 K8s 基本部署"
+    }
+  ],
+  "educations": [
+    {
+      "school": "合肥工业大学",
+      "degree": "本科",
+      "major": "软件工程",
+      "start_year": 2016,
+      "graduate_year": 2020,
+      "evidence": "2016.09-2020.06 合肥工业大学 软件工程 学士"
+    }
+  ],
+  "work_experiences": [
+    {
+      "company": "安徽云启信息科技有限公司",
+      "role": "后端开发工程师",
+      "start": "2020-07-01",
+      "end": "2023-03-31",
+      "summary": "订单中心重构，日均 200 万单",
+      "evidence": "2020.07-2023.03 安徽云启信息科技 后端开发工程师"
+    },
+    {
+      "company": "杭州量川网络科技有限公司",
+      "role": "高级后端开发工程师",
+      "start": "2023-04-01",
+      "end": null,
+      "summary": "支付网关与风控链路",
+      "evidence": "2023.04 至今 杭州量川网络科技 高级后端开发工程师"
+    }
+  ],
+  "projects": [
+    {
+      "name": "分布式库存服务",
+      "role": "技术负责人",
+      "summary": "把单机库存扣减改造为基于 Redis 原子操作的分布式方案",
+      "highlights": [
+        "扣减接口 P99 从 180ms 降到 45ms",
+        "引入本地缓存兜底，超卖投诉归零"
+      ],
+      "evidence": "项目：分布式库存服务，担任技术负责人"
+    }
+  ]
+}

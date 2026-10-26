@@ -1,0 +1,16 @@
+{
+  "node": "ner",
+  "prompt_version": "v1",
+  "purpose": "extract",
+  "model": "deepseek-chat",
+  "missing": "name",
+  "raw_text_chars": 2817,
+  "response": "{\"name\": {\"value\": \"梁清生\", \"evidence\": \"梁清生\"}}",
+  "usage": {
+    "deepseek-chat": {
+      "prompt": 1664,
+      "completion": 20,
+      "calls": 1
+    }
+  }
+}

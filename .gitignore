@@ -1,0 +1,51 @@
+# 环境与密钥
+.env
+*.env.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 前端：依赖与构建产物都不进库（后端只读 frontend/dist）
+node_modules/
+frontend/dist/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 本地数据与日志
+data/uploads/*
+!data/uploads/.gitkeep
+# uploads 的 README 只说明"这个目录装什么、为什么入库不了"，本身不是数据
+!data/uploads/README.md
+# SQLite 运行期文件：主库 + WAL 的两个附属文件。checkpoint 库（LangGraph 线程状态）
+# 也在 data/ 下，一并忽略——里面是真实简历抽取结果，属于个人数据。
+data/*.db
+data/*.db-wal
+data/*.db-shm
+# 主库的手动备份（名字带 .bak）：和主库同源，同样是个人数据
+data/*.bak*
+logs/
+*.log
+
+# 脚本产物与临时目录
+# reports/ 是 scripts/export_report_md.py 的输出，文件名与正文都带真实候选人姓名；
+# .export-tmp/ 是浏览器导出报告时的 Chrome profile 与截图。
+reports/
+.export-tmp/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

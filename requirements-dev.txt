@@ -1,0 +1,10 @@
+# 开发依赖。版本下界已在 .venv（Python 3.14.7）用 `pip install --dry-run` 验证（2026-10-14）。
+-r requirements.txt
+
+ruff>=0.17            # make lint / make fmt
+mypy>=2.4             # make type
+pytest>=9.1
+pytest-asyncio>=1.4   # pyproject 里 asyncio_mode = auto
+pytest-cov>=7.1       # make cov
+httpx>=0.28           # TestClient / ASGITransport
+pip-audit>=2.10       # 依赖漏洞扫描

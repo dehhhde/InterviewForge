@@ -1,0 +1,333 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "InterviewForge · LangGraph 工作流",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "D:/code/InterviewForge/docs/interviewforge-langgraph-workflow.html"
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "主干：解析 → 校验 → 匹配 → 画像 → 配额"
+    },
+    {
+      "id": "write",
+      "label": "出题（Send 并行扇出）"
+    },
+    {
+      "id": "gate",
+      "label": "评审质量门",
+      "variant": "exception"
+    },
+    {
+      "id": "out",
+      "label": "落库"
+    }
+  ],
+  "phases": [
+    {
+      "id": "phase_parse",
+      "label": "抽取与自洽校验",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "phase_design",
+      "label": "缺口 → 画像 → 配额表",
+      "fromCol": 2,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "phase_write",
+      "label": "出题 · 评审 · 落库",
+      "fromCol": 5,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "groups": [
+    {
+      "id": "group_main",
+      "label": "主干五节点",
+      "lane": "main",
+      "fromCol": 0,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "group_fanout",
+      "label": "Send ×N 并行分支",
+      "lane": "write",
+      "fromCol": 0,
+      "toCol": 5,
+      "variant": "dashed"
+    },
+    {
+      "id": "group_gate",
+      "label": "质量门 ②",
+      "lane": "gate",
+      "fromCol": 0,
+      "toCol": 5,
+      "variant": "security"
+    }
+  ],
+  "mainPath": [
+    "parse",
+    "validate",
+    "match",
+    "profile",
+    "plan",
+    "generate",
+    "generate_item",
+    "review",
+    "persist"
+  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "parse"
+    ],
+    "allowedTerminals": [
+      "persist"
+    ],
+    "requiredEdges": [
+      {
+        "from": "parse",
+        "to": "validate"
+      },
+      {
+        "from": "validate",
+        "to": "match"
+      },
+      {
+        "from": "validate",
+        "to": "parse"
+      },
+      {
+        "from": "match",
+        "to": "profile"
+      },
+      {
+        "from": "profile",
+        "to": "plan"
+      },
+      {
+        "from": "plan",
+        "to": "generate"
+      },
+      {
+        "from": "generate",
+        "to": "generate_item"
+      },
+      {
+        "from": "generate_item",
+        "to": "review"
+      },
+      {
+        "from": "review",
+        "to": "generate"
+      },
+      {
+        "from": "review",
+        "to": "persist"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "parse",
+      "lane": "main",
+      "col": 0,
+      "type": "backend",
+      "label": "parse 解析",
+      "sublabel": "解析 → NER 抽取",
+      "tag": "1 次 LLM",
+      "width": 116
+    },
+    {
+      "id": "validate",
+      "lane": "main",
+      "col": 1,
+      "type": "backend",
+      "label": "validate 校验",
+      "sublabel": "规则全过才问模型",
+      "tag": "质量门 ①",
+      "width": 116
+    },
+    {
+      "id": "match",
+      "lane": "main",
+      "col": 2,
+      "type": "backend",
+      "label": "match 匹配",
+      "sublabel": "词典对齐 + 问模型",
+      "tag": "LLM",
+      "width": 116
+    },
+    {
+      "id": "profile",
+      "lane": "main",
+      "col": 3,
+      "type": "backend",
+      "label": "profile 画像",
+      "sublabel": "rubric 打分 + 叙述",
+      "tag": "LLM",
+      "width": 116
+    },
+    {
+      "id": "plan",
+      "lane": "main",
+      "col": 4,
+      "type": "backend",
+      "label": "plan 配额表",
+      "sublabel": "难度配额，纯算术",
+      "tag": "不调 LLM",
+      "width": 116
+    },
+    {
+      "id": "generate",
+      "lane": "write",
+      "col": 4,
+      "type": "backend",
+      "label": "generate 准备",
+      "sublabel": "预算护栏 · 批次号",
+      "tag": "Overwrite 清批",
+      "width": 116
+    },
+    {
+      "id": "generate_item",
+      "lane": "write",
+      "col": 5,
+      "type": "messagebus",
+      "label": "generate_item",
+      "sublabel": "每槽位一次调用",
+      "tag": "Send 载荷",
+      "width": 116
+    },
+    {
+      "id": "review",
+      "lane": "gate",
+      "col": 5,
+      "type": "security",
+      "label": "review 评审",
+      "sublabel": "规则先判，模型挑刺",
+      "tag": "质量门 ②",
+      "width": 116
+    },
+    {
+      "id": "persist",
+      "lane": "out",
+      "col": 5,
+      "type": "database",
+      "label": "persist 落库",
+      "sublabel": "终局写报告与题",
+      "tag": "review 内部收尾",
+      "width": 116
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge_parse_validate",
+      "from": "parse",
+      "to": "validate",
+      "label": "raw_text · parsed",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_validate_match",
+      "from": "validate",
+      "to": "match",
+      "label": "规则全过",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_validate_parse",
+      "from": "validate",
+      "to": "parse",
+      "label": "issues 且预算未用尽",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "edge_match_profile",
+      "from": "match",
+      "to": "profile",
+      "label": "matched_gaps",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_profile_plan",
+      "from": "profile",
+      "to": "plan",
+      "label": "focus_topics",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_plan_generate",
+      "from": "plan",
+      "to": "generate",
+      "label": "items",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_generate_item",
+      "from": "generate",
+      "to": "generate_item",
+      "label": "Send ×N 并行派发",
+      "variant": "emphasis",
+      "role": "async"
+    },
+    {
+      "id": "edge_item_review",
+      "from": "generate_item",
+      "to": "review",
+      "label": "题目累加",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "edge_review_generate",
+      "from": "review",
+      "to": "generate",
+      "label": "占比 > 0.3 且预算未用尽",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "edge_review_persist",
+      "from": "review",
+      "to": "persist",
+      "label": "通过 / 预算用尽",
+      "variant": "default",
+      "role": "main"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "回退与质量门",
+      "items": [
+        "validate_max_retries = 2 → parse 最多重跑 3 次",
+        "review_max_retries = 2 → generate 最多重做 3 次",
+        "should_redo 路由与节点共用一处，阈值 0.3",
+        "评审两种终局：completed 写题 / aborted 空题表"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "扇出与观测",
+      "items": [
+        "一条 plan 槽位一次 LLM 调用，默认 15 题",
+        "trace / errors 只追加，prompt_version 落在 trace",
+        "每个超步写 checkpoint 到 data/checkpoints.db"
+      ]
+    }
+  ]
+}

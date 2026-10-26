@@ -1,0 +1,53 @@
+# 生产依赖。
+#
+# 本机部署策略（无 Docker）：
+#   PostgreSQL + pgvector  ->  SQLite + sqlite-vec
+#   Redis + Celery         ->  FastAPI BackgroundTasks（asyncio 原生；上传端点需要 python-multipart）
+#   LangGraph PostgresSaver->  SqliteSaver / AsyncSqliteSaver
+#
+# 本清单已在 .venv（Python 3.14.7）通过 `pip install --dry-run -r requirements.txt` 验证可解析（2026-10-14）。
+# 原注释说本文件由 `uv export` 生成，但当前环境未安装 uv，故直接手工维护；版本号取已验证的下界。
+
+# --- Web / 配置 ---
+fastapi>=0.143
+uvicorn[standard]>=0.54
+pydantic>=2.14
+pydantic-settings>=2.15
+email-validator>=2.3          # pydantic EmailStr
+python-dotenv>=1.2            # 读取 .env
+python-multipart>=0.0.20      # FastAPI UploadFile（`POST /resumes/upload`，M6）；缺它路由定义期就报错
+PyYAML>=6.0                   # 读取 configs/*.yaml（langchain-core 的传递依赖，但 config.py 直接 import）
+
+# --- Agent 编排 / LLM 调用 ---
+langgraph>=1.2
+langchain-core>=1.6           # langgraph 的传递依赖，但节点里会直接 import，显式声明
+langgraph-checkpoint-sqlite>=3.1   # 会话状态持久化，替代 PostgresSaver
+aiosqlite>=0.22               # AsyncSqliteSaver 所需的异步驱动
+openai>=3.31                  # DeepSeek/Qwen 均走 OpenAI 兼容端点
+httpx>=0.28
+tenacity>=9.2                 # llm_client 传输层重试（langchain-core 的传递依赖，但被直接 import）
+Jinja2>=3.1                   # prompts/registry.py 模板渲染
+
+# --- 数据层（SQLite 替代 PostgreSQL）---
+# 必须带 [asyncio] extra：它拉的是 greenlet，而 SQLAlchemy 的 asyncio 模块在没有
+# greenlet 时连 import 都会失败（Python 3.14 上 pip 不会自动装）。实测 2026-10-16。
+sqlalchemy[asyncio]>=2.1
+alembic>=1.20
+
+# --- 向量检索（sqlite-vec 替代 pgvector）---
+sqlite-vec>=0.1.9
+numpy>=2.5                    # 本地算相似度 / 归一化
+
+# --- 简历文件解析 ---
+PyMuPDF>=1.28                 # PDF 文字块坐标与分栏重建，见 docs/adr/0006-pdf-engine.md（AGPL-3.0 双许可）
+python-docx>=1.2
+
+# --- 定时任务（替代 Celery beat，可选）---
+apscheduler>=3.11
+
+# ===== 已按"无 Docker"策略移除，需要时再启用 =====
+# asyncpg / psycopg[binary]  # 仅 PostgreSQL 需要
+# pgvector                   # 仅 PostgreSQL 需要
+# celery / redis / hiredis   # 改用 BackgroundTasks；若任务需持久队列或跨进程再引入
+# langfuse                   # 自托管需 Docker；若改用 Langfuse 云平台可加 `langfuse>=3`
+# paddlepaddle / paddleocr   # Python 3.14 无分发，图片简历改走多模态 LLM（见 README §8.4）
