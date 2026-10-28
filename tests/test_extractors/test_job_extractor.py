@@ -8,13 +8,12 @@
 
 import json
 from collections.abc import Sequence
-from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
 from app.extractors.job_extractor import JobFieldExtractor, extract_by_rules
 from app.utils.llm_client import LLMClient
+from tests.test_agents._fake_llm import FakeCompletions, stamp
 
 #: 中文 JD 的理想形状：三项都带字形，规则层全包
 _LABELED = "岗位名称：后端开发工程师\n公司名称：示例科技有限公司\n任职要求：3-5 年工作经验"
@@ -22,25 +21,8 @@ _LABELED = "岗位名称：后端开发工程师\n公司名称：示例科技有
 _POSTER = "【高级后端工程师】Base 上海\n某某研究院 招聘\n经验：5 年以上"
 
 
-class _FakeCompletions:
-    """替身：按顺序吐预置回复，记下每次 `create` 的 kwargs。"""
-
-    def __init__(self, replies: Sequence[str]) -> None:
-        self.replies = list(replies)
-        self.calls: list[dict[str, Any]] = []
-        self.chat = SimpleNamespace(completions=self)
-
-    async def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        text = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-        )
-
-
-def _extractor(replies: Sequence[str]) -> tuple[JobFieldExtractor, _FakeCompletions]:
-    fake = _FakeCompletions(replies)
+def _extractor(replies: Sequence[str]) -> tuple[JobFieldExtractor, FakeCompletions]:
+    fake = FakeCompletions(replies)
     return JobFieldExtractor(llm=LLMClient(client=fake)), fake
 
 
@@ -107,7 +89,7 @@ async def test_llm_fallback_is_asked_only_for_the_gaps() -> None:
 
     assert (result.company.value, result.company.source) == ("某电商平台", "llm")
     assert result.title.value == "后端工程师", "规则层的结果不被兜底覆盖"
-    assert result.prompt_version == "job_fields@v1"
+    assert result.prompt_version == stamp("job_fields")
     assert result.missing == ()
     assert len(fake.calls) == 1
     sent = fake.calls[0]["messages"]

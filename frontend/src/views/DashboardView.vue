@@ -14,13 +14,19 @@ import {
 import type { EChartsOption } from 'echarts'
 
 import { getInterview, listInterviews, listJobs, listResumes } from '@/api'
-import type { Interview, Job, Resume } from '@/api/types'
+import type {
+  Interview,
+  InterviewListItem,
+  JobListItem,
+  ResumeListItem,
+} from '@/api/types'
 import ChartPanel from '@/components/ChartPanel.vue'
 import EmptyBlock from '@/components/EmptyBlock.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import StatCard from '@/components/StatCard.vue'
 import StatusPill from '@/components/StatusPill.vue'
 import { useAppStore } from '@/stores/app'
+import { POLL_INTERVAL_MS } from '@/utils/task'
 import {
   DIFFICULTY_LABEL,
   NODE_DESCRIPTION,
@@ -34,11 +40,19 @@ import {
 const router = useRouter()
 const store = useAppStore()
 
-const resumes = ref<Resume[]>([])
-const jobs = ref<Job[]>([])
-const interviews = ref<Interview[]>([])
+const resumes = ref<ResumeListItem[]>([])
+const jobs = ref<JobListItem[]>([])
+const interviews = ref<InterviewListItem[]>([])
 const details = ref<Interview[]>([])
 const loading = ref(true)
+
+/**
+ * 统计卡用服务端的 `total`〔T-303〕：本页只有前 200 行，
+ * 而"有多少份"数的是全部行数——两者在数据多了以后必然不一致。
+ */
+const resumeTotal = ref(0)
+const jobTotal = ref(0)
+const reportTotal = ref(0)
 
 const sortedReports = computed(() =>
   [...interviews.value].sort((left, right) => right.created_at.localeCompare(left.created_at)),
@@ -134,16 +148,21 @@ const difficultyOption = computed<EChartsOption>(() => ({
 async function load(): Promise<void> {
   loading.value = true
   try {
-    const [resumeRows, jobRows, interviewRows] = await Promise.all([
-      listResumes(200),
-      listJobs(200),
-      listInterviews(200),
+    const [resumePage, jobPage, interviewPage] = await Promise.all([
+      listResumes(),
+      listJobs(),
+      listInterviews(),
     ])
-    resumes.value = resumeRows
-    jobs.value = jobRows
-    interviews.value = interviewRows
+    resumes.value = resumePage.items
+    jobs.value = jobPage.items
+    interviews.value = interviewPage.items
+    resumeTotal.value = resumePage.total
+    jobTotal.value = jobPage.total
+    reportTotal.value = interviewPage.total
 
-    const recent = interviewRows.filter((report) => report.status === 'completed').slice(0, 8)
+    const recent = interviewPage.items
+      .filter((report) => report.status === 'completed')
+      .slice(0, 8)
     const settled = await Promise.allSettled(recent.map((report) => getInterview(report.id)))
     details.value = settled
       .filter((item): item is PromiseFulfilledResult<Interview> => item.status === 'fulfilled')
@@ -155,7 +174,7 @@ async function load(): Promise<void> {
   }
 }
 
-function openReport(report: Interview): void {
+function openReport(report: InterviewListItem): void {
   void router.push(`/reports/${report.id}`)
 }
 
@@ -182,21 +201,21 @@ onMounted(() => {
     <div class="grid grid-4" v-loading="loading">
       <StatCard
         label="简历"
-        :value="resumes.length"
-        :hint="`${resumes.filter((resume) => resume.name).length} 份已完成结构化抽取`"
+        :value="resumeTotal"
+        :hint="`${resumes.filter((resume) => resume.name).length} 份已完成结构化抽取（本页 ${resumes.length} 行）`"
         tone="brand"
         :icon="Tickets"
       />
       <StatCard
         label="岗位"
-        :value="jobs.length"
+        :value="jobTotal"
         hint="JD 技能由确定性词典派生"
         tone="violet"
         :icon="Briefcase"
       />
       <StatCard
         label="报告"
-        :value="interviews.length"
+        :value="reportTotal"
         :hint="`最近 ${details.length} 份累计 ${totalQuestions} 道题`"
         tone="green"
         :icon="Document"
@@ -298,7 +317,10 @@ onMounted(() => {
       <div class="card-head">
         <div>
           <h3>七节点工作流</h3>
-          <p>图在后台运行，页面每 2 秒轮询一次任务进度；题目只在评审收尾一次性落库。</p>
+          <p>
+            图在后台运行，页面每 {{ POLL_INTERVAL_MS / 1000 }} 秒轮询一次任务进度；
+            题目只在评审收尾一次性落库。
+          </p>
         </div>
         <span class="pill live">LangGraph</span>
       </div>

@@ -22,10 +22,41 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.base import ORMModel
+
+
+def contains(column: ColumnElement[str], keyword: str) -> ColumnElement[bool]:
+    r"""关键词命中某一列的条件。
+
+    转义是这条的全部技术含量：`%` 与 `_` 是 LIKE 的通配符，而关键词是用户输入的。
+    不转义的话，搜索框里打一个 `%` 就等于"命中全部"，打 `_` 会替掉一个字符——
+    那不是搜索，那是让用户手写 SQL 的模式串。反斜杠本身也要先 doubling，
+    否则 `\%` 会被读成"转义过的反斜杠"再挂上通配符。
+    """
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return column.ilike(f"%{escaped}%", escape="\\")
+
+
+def keyword_filter(
+    model: type[ORMModel], keyword: str, columns: Sequence[str]
+) -> Sequence[ColumnElement[bool]]:
+    """把"任一列命中关键词"拼成 `filters`；关键词为空就返回空条件。
+
+    列名走 `column_names()` 白名单，和 `list()` 的 `order_by` 同一个口径：这是第二处
+    "字符串来自调用方却参与 SQL 构造"的地方，不能因为它在 repository 层就免检。
+    返回的是**条件列表**而不是单个 `or_`，调用方可以直接把它同时喂给 `list` 与 `count`
+    ——`total` 必须数的是过滤后的行数，两处用两个条件就会各说各话。
+    """
+    if not keyword.strip():
+        return ()
+    allowed = model.column_names()
+    for name in columns:
+        if name not in allowed:
+            raise ValueError(f"{model.__name__} 无列 {name!r}，可用：{allowed}")
+    return (or_(*(contains(getattr(model, name), keyword.strip()) for name in columns)),)
 
 
 class BaseRepository[ModelT: ORMModel]:

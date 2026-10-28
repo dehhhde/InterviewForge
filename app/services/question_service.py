@@ -38,6 +38,22 @@ _KNOWN_SOURCES: dict[str, str] = {"resume": "resume", "jd": "jd", "generic": "ge
 #: 每种来源的引用该去哪儿核，以及给人看的说法。`generic` 不在表里：它不声称出处，引用可选
 SOURCE_CORPUS_LABELS: dict[str, str] = {"resume": "简历原文", "jd": "岗位 JD 原文"}
 
+#: 语料键名 -> 它在 state / `GenerateJob` 里的字段名。`corpora_for` 发的就是这些键。
+_CORPUS_FIELDS = ("raw_text", "jd_text")
+
+
+def corpora_for(source: str) -> tuple[str, ...]:
+    """这道题的引用要到哪几份语料里逐字核对。**扇出瘦身与闸门共用这一个判据**。
+
+    `workflow.route_after_generate` 靠它决定"这个槽位该带哪份原文"，`verify_evidence` 靠它
+    决定"拿哪份原文去核"。分成两处写就会漂移：载荷少带一份语料，闸门在那一档里查不到，
+    题被整批丢弃——和 2026-10-20 漏 `jd_text` 那次是同一个形状的事故。
+    """
+    if source not in SOURCE_CORPUS_LABELS:
+        # `generic` 与任何表外来源：它不声称出处，引用出自哪一侧都算
+        return _CORPUS_FIELDS
+    return ("raw_text",) if source == "resume" else ("jd_text",)
+
 
 @dataclass(frozen=True, slots=True)
 class _Drop:
@@ -103,21 +119,24 @@ def verify_evidence(
       "基于 JD 出题"和编造没法区分，宁可少一题。
     - `generic`：引用可选。带了就在简历或 JD 里核对（它可能确实顺手引了原文），核不上
       只置空并记一句——题干没有声称出处，丢了它题就不能用了。
+
+    两份语料的取舍一律走 `corpora_for`，别在这里再写一遍 `if source == ...`：扇出载荷
+    带哪份原文用的是同一个判据，两处各写一遍就是两套闸门。
     """
-    if source not in SOURCE_CORPUS_LABELS:
+    fields = {"raw_text": raw_text, "jd_text": jd_text}
+    corpora = [fields[key] for key in corpora_for(source) if fields[key]]
+    label = SOURCE_CORPUS_LABELS.get(source)
+
+    if label is None:
         if not evidence:
             return "", None
-        if evidence_belongs(raw_text, evidence) or (
-            bool(jd_text) and evidence_belongs(jd_text, evidence)
-        ):
+        if any(evidence_belongs(corpus, evidence) for corpus in corpora):
             return evidence, None
         return "", f"非简历来源的题目带了核对不上的引用，已置空：{evidence[:40]!r}"
 
-    corpus = raw_text if source == "resume" else jd_text
-    label = SOURCE_CORPUS_LABELS[source]
     if not evidence:
         return "", _Drop(f"声称基于{label}出题却没给原文引用")
-    if not evidence_belongs(corpus, evidence):
+    if not any(evidence_belongs(corpus, evidence) for corpus in corpora):
         return "", _Drop(f"引用在{label}里找不到：{evidence[:40]!r}")
     return evidence, None
 

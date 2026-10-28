@@ -10,6 +10,9 @@
   的顺序），所以每档与 `ratio * total` 的偏差必然 < 1，且各档之和恰好等于 total；
 - 主题铺放按 `profile.focus_topics` 的既有顺序（rubric 已经把它排成弱项在前）**轮流**发牌，
   同档内不比较、不打乱、不读时间，所以同一份 profile 跑两次必然得到同一张表。
+
+考察角度（`angles`）走同一套确定性：它由 `(difficulty, 题序)` 查表得来，不看时间、不看随机数，
+所以加进配额表没有破坏上面那条验收〔T-202〕。
 """
 
 from collections.abc import Mapping, Sequence
@@ -25,6 +28,21 @@ from app.services.profile_service import MAX_FOCUS_TOPICS
 #: 难度档顺序 = `DifficultyRatio` 的字段顺序。平局时按这个先后发名额，
 #: 所以它必须写死而不是从 dict 里赌一次
 DIFFICULTY_ORDER: tuple[str, ...] = ("easy", "medium", "hard")
+
+#: 每档的考察角度池〔T-202〕。配额表原先只给 `topic` + `difficulty`，于是同一主题的
+#: easy/medium/hard 三档各自写出"那道最经典的题"——实测第三跑 4 条批注里 3 条是换皮重复。
+#: 角度由 `plan` 定而不是由分支即兴：扇出的分支互相看不见（ADR-0010），让它们自己挑角度
+#: 等于把去重交给运气。
+#:
+#: 分档是因为角度必须与难度相配：让 hard 槽位去问"名词与定义"，配额表就名存实亡。
+#: 每档 4 条是实测口径下的余量——`allocate` 通常给一个槽位 1–3 题（`question.total=15`
+#: 分给至多 8 个主题），够铺满不回头；第 5 题起按池长取模重复，那种形状意味着
+#: 主题数远少于题数，届时该扩的是池而不是判据。
+ANGLES_BY_DIFFICULTY: dict[str, tuple[str, ...]] = {
+    "easy": ("名词与定义", "典型使用场景", "基本用法", "与相邻概念的差别"),
+    "medium": ("实现原理", "动手落地", "配置与参数取舍", "常见误用"),
+    "hard": ("方案取舍", "规模化瓶颈", "故障复盘与改进", "权衡的代价"),
+}
 
 #: 画像没给出任何主题时的兜底槽位名。走到这里说明简历与 JD 都没提供可引的东西，
 #: 与其让 total 落空，不如出一档通用题并把这个事实记进 `errors`
@@ -83,9 +101,22 @@ def allocate(
                     "source": _item_source(topic),
                     "evidence": topic.get("evidence"),
                     "rationale": str(topic.get("why") or ""),
+                    # 按题序发角度：同一档内第 i 题拿池里第 i 条，池用完才取模〔T-202〕
+                    "angles": _angles_for(name, count),
                 }
             )
     return items
+
+
+def _angles_for(difficulty: str, count: int) -> list[str]:
+    """这个槽位的每一道题各自的角度（顺序与题号对应）。
+
+    用列表而不是一个词：一个槽位可以出 2–3 题，只给一个角度等于把重复从"跨槽位"
+    挪进"槽位内"。取模是明写的兜底，不是判据——池子按档位给到 4 条，
+    `MAX_QUESTIONS_PER_ITEM=6` 封住上界，最坏情况第 5、6 题与第 1、2 题同角度。
+    """
+    pool = ANGLES_BY_DIFFICULTY.get(difficulty) or ANGLES_BY_DIFFICULTY["medium"]
+    return [pool[offset % len(pool)] for offset in range(count)]
 
 
 def _item_source(topic: Mapping[str, Any]) -> str:

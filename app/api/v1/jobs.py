@@ -21,18 +21,35 @@ from typing import Annotated
 
 from fastapi import APIRouter, File, Form, UploadFile
 
-from app.dependencies import LLMDep, SessionDep
+from app.dependencies import KeywordQuery, LLMDep, PageLimit, PageOffset, SessionDep
 from app.exceptions.base import NotFoundError
-from app.schemas.job import JobCreateRequest, JobDraftOut, JobOut, JobUpdateRequest
+from app.schemas.common import Page
+from app.schemas.job import (
+    JobCreateRequest,
+    JobDraftOut,
+    JobListItem,
+    JobOut,
+    JobUpdateRequest,
+)
 from app.services import job_service
+from app.utils import file_handler
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
-@router.get("", response_model=list[JobOut])
-async def list_jobs(session: SessionDep, limit: int = 50, offset: int = 0) -> list[JobOut]:
-    rows = await job_service.list_jobs(session, limit=limit, offset=offset)
-    return [JobOut.model_validate(row) for row in rows]
+@router.get("", response_model=Page[JobListItem])
+async def list_jobs(
+    session: SessionDep,
+    limit: PageLimit = 50,
+    offset: PageOffset = 0,
+    q: KeywordQuery = "",
+) -> Page[JobListItem]:
+    """一页岗位（精简行）+ 满足同一条件的总数〔T-303 外壳 / T-301 投影〕。
+
+    列表行只发 JD 的前 160 字：整篇原文在 `GET /jobs/{id}` 给，编辑抽屉要读全文就点一行拉一次。
+    """
+    rows, total = await job_service.list_jobs(session, limit=limit, offset=offset, q=q)
+    return Page(items=[JobListItem.from_row(row) for row in rows], total=total)
 
 
 @router.post("", status_code=201, response_model=JobOut)
@@ -54,9 +71,11 @@ async def upload_job(
 ) -> JobOut:
     """文件建岗：`.txt` / `.md` / `.pdf` / `.docx` 读成文本，其余流程与 `POST /jobs` 同一条。
 
-    整份读进内存再解，理由与简历上传一样：JD 是页级小文件，几 KB 到几十 KB。
+    整份读进内存再解，理由与简历上传一样：JD 是页级小文件，几 KB 到几十 KB；
+    上限与魔数核对同样走 `file_handler`（BACKLOG P0-2）。
     """
-    data = await file.read()
+    data = await file_handler.read_capped(file)
+    file_handler.check_kind(data, file_name=file.filename or "")
     job = await job_service.create_job_from_upload(
         session,
         file_name=file.filename or "",
@@ -81,7 +100,8 @@ async def inspect_job_image(
     这是本模块唯一花模型调用的端点（1 次读图 + 至多 1 次补字段），但仍然同步返回：
     它的产出是一份要人过目的草稿，不是一个要轮询的任务。
     """
-    data = await file.read()
+    data = await file_handler.read_capped(file)
+    file_handler.check_kind(data, file_name=file.filename or "")
     return await job_service.draft_job_from_image(file_name=file.filename or "", data=data, llm=llm)
 
 

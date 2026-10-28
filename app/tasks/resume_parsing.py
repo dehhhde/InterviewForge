@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 from time import perf_counter
 from typing import Any
 
@@ -23,10 +24,13 @@ from app.agents.nodes.parse_node import make_parse_node
 from app.agents.workflow import PROMPT_VERSION_KEY, Node
 from app.config import Settings, get_settings
 from app.dependencies import get_sessionmaker
+from app.exceptions.base import AppError
 from app.repositories.resume_repository import ResumeRepository
 from app.services import task_service
 from app.utils.db import session_scope
 from app.utils.llm_client import LLMClient
+
+logger = logging.getLogger("app.tasks.resume_parsing")
 
 
 async def run_resume_parsing(
@@ -47,38 +51,81 @@ async def run_resume_parsing(
     sessions = sessionmaker or get_sessionmaker()
     await task_service.mark_running(sessions, task_id)
 
-    parser = node or make_parse_node(llm=llm or LLMClient(settings), settings=settings)
+    if node is not None:
+        parser = node
+    else:
+        client = llm or LLMClient(settings)
+        parser = make_parse_node(llm=client, settings=settings)
     try:
         started = perf_counter()
         update = dict(await parser({"resume_id": resume_id}))
     except Exception as exc:  # 任务边界就是要兜住一切，落库后不再上抛
-        await task_service.mark_failed(sessions, task_id, exc)
+        await task_service.mark_failed_logged(sessions, task_id, exc)
         return {"ok": False}
+    finally:
+        # 后台任务自建的真客户端没人关就会攒连接池（T-011）；注入的替身归调用方管。
+        if node is None and llm is None:
+            await client.aclose()
 
     notes = [str(note) for note in update.get("errors") or []]
     parsed = update.get("parsed") or {}
     try:
         async with session_scope(sessions) as session:
-            await ResumeRepository(session).update(
+            row = await ResumeRepository(session).update(
                 resume_id,
                 raw_text=str(update.get("raw_text") or ""),
                 parsed=parsed,
                 name=str(parsed.get("name") or ""),
             )
     except Exception as exc:  # 同上：写库失败也要给轮询方一个 `failed`
-        await task_service.mark_failed(sessions, task_id, exc)
+        await task_service.mark_failed_logged(sessions, task_id, exc)
         return {"ok": False}
 
-    await task_service.record_step(
-        sessions, task_id, "parse", ms=round((perf_counter() - started) * 1000, 2)
-    )
+    if row is None:
+        # 解析期间简历被删了（`DELETE /resumes/{id}` 或 `force` 级联）。
+        # 报成功等于让轮询方去读一行已经不存在的简历，比报失败更难解释。
+        await task_service.mark_failed_logged(
+            sessions,
+            task_id,
+            AppError(
+                "简历在解析过程中被删除，解析结果没有落点",
+                code="resume_gone",
+                status_code=404,
+                details={"resume_id": resume_id},
+            ),
+        )
+        return {"ok": False}
+
     result: dict[str, Any] = {
         "resume_id": resume_id,
         "name": str(parsed.get("name") or ""),
         "note_count": len(notes),
     }
     prompt_version = str(update.pop(PROMPT_VERSION_KEY, ""))
-    if prompt_version:
-        result["prompt_version"] = prompt_version
-    await task_service.mark_completed(sessions, task_id, result)
+    await _record_completed(sessions, task_id, started, result, prompt_version)
     return {"ok": True, **result}
+
+
+async def _record_completed(
+    sessions: async_sessionmaker[AsyncSession],
+    task_id: str,
+    started: float,
+    result: dict[str, Any],
+    prompt_version: str,
+) -> None:
+    """成功终态与 `parse` 进度步落库：写不进去只记日志，不改口报失败。
+
+    结果已经在那一刻写进 `resume` 行了，收尾这两笔只是给轮询方看的；把它们裸在 `try`
+    外面会让 DB 一抖就冒出后台协程，任务停在 `running` 而业务行是好的（BACKLOG P1-4）。
+    """
+    try:
+        await task_service.record_step(
+            sessions, task_id, "parse", ms=round((perf_counter() - started) * 1000, 2)
+        )
+        if prompt_version:
+            result["prompt_version"] = prompt_version
+        await task_service.mark_completed(sessions, task_id, result)
+    except Exception:
+        logger.exception(
+            "简历 %s 解析完了但终态没写进去，轮询方会一直看到 running", result["resume_id"]
+        )

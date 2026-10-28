@@ -2,9 +2,13 @@
 name = "interview-forge"
 version = "0.1.0"
 description = "基于 LangGraph Agent 的简历解析与面试题生成系统"
-requires-python = ">=3.12"
+# 与运行时对齐：本机唯一受支持的解释器是 `.venv` 里的 **3.14.7**（AGENTS.md §2）。
+# 原先写 >=3.12 是一句没人验证的声明——3.12/3.13 上从没跑过，而 `sqlalchemy[asyncio]`
+# 在 3.14 上的 extra 行为本身就与更早版本不同（缺 greenlet 时 import 直接失败）。
+requires-python = ">=3.14"
 
-# 依赖按阶段引入，不要一次装完（见 LEARNING_ROADMAP.md §16）
+# 依赖不在这里声明，实际清单是 `requirements.txt`（BACKLOG TODO §3 挂的就是这条欠账：
+# 两处口径要合并时，以能被 `pip install -r` 消费的那份为准）。
 dependencies = []
 
 [project.optional-dependencies]
@@ -12,7 +16,7 @@ dev = []
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC"]
@@ -23,7 +27,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC"]
 "migrations/versions/*" = ["E501"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 plugins = ["pydantic.mypy"]
 ignore_missing_imports = true
 check_untyped_defs = true

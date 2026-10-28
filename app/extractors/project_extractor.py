@@ -5,16 +5,20 @@
 `timeline_extractor`，这里不收。子标题只当分块标记，不入正文。
 
 `highlights` 收编号要点（`1.`、`2、`、`- `），散文归 `summary`——分开存是因为 M5 出题时
-要拿要点当题干里的"你提到 XX，具体怎么做的"。
+要拿要点当题干里的"你提到 XX，具体怎么做的"。但**编号行有两类**：`1. 权限管理体系`
+是分组标题，`1、设计自适应直传策略` 才是成果条目，判据见 `_is_numbered_subheading`。
+前者只开新桶、不进 `highlights`（实测：真简历 5 行分组标题混进要点后，模型评审有一半意见
+在报这件事，而出题会拿"业务能力"这种光秃秃的标签当题干）。
 
 每条都带 `evidence`（整块原文，空白折叠过），并且必须能在 `raw_text` 里核对上；
 对不上说明切分拼错了行，宁可丢弃并记进 `notes`。
 """
 
+import re
 from dataclasses import dataclass, field
 
-from app.extractors.base import collapse, evidence_belongs
-from app.extractors.sections import SubName, header_kind, is_bullet, split_sections
+from app.extractors.base import collapse, evidence_belongs, join_wrapped_lines
+from app.extractors.sections import SectionMap, SubName, header_kind, is_bullet, split_sections
 from app.extractors.timeline_extractor import parse_range
 from app.schemas.resume import ProjectExperience
 
@@ -24,6 +28,32 @@ _MAX_EVIDENCE_CHARS = 400
 #: 项目名不会写成整句，带句读的短行是换行剩下的正文尾巴
 _PROSE_MARKS = "。；，！？;!?"
 _TITLE_MAX_CHARS = 40
+#: 编号行去掉编号后超过这个长度就当成果条目（"1、设计基于文件大小的自适应直传…"）
+_SUBHEADING_MAX_CHARS = 14
+#: 分组标题是名词短语，句内不该有分隔标点；出现标点就说明这是一句话、是一个条目
+_SUBHEADING_MARKS = "，,、；;：:。！!？?"
+#: 编号 `1.` / `2、` / `3)`；`-`/`•` 这类项目符号不是编号，不参与本判据
+_NUMBER_MARKER_RE = re.compile(r"^\s*\d{1,2}\s*[.、)）]\s*(?P<body>.*)$")
+#: 成果条目几乎总以动作词开头。表只收"条目会带、标题不会带"的词：
+#: 判不准时按条目处理，那等于改动前的行为（宁松不紧，少丢真要点）。
+_ACTION_LEADING = (
+    "负责", "参与", "主导", "梳理", "对接", "保障", "提升", "降低", "支持", "采用",
+    "基于", "使用", "运用", "设计", "实现", "搭建", "构建", "完成", "开发", "引入",
+    "落地", "优化", "提供", "输出", "打通", "封装", "沉淀", "推动", "研发", "覆盖",
+)
+
+
+def _is_numbered_subheading(text: str) -> bool:
+    """`1. 权限管理体系` 这类编号**分组标题**；`1、设计自适应直传策略` 不是。"""
+    found = _NUMBER_MARKER_RE.match(text)
+    if found is None:
+        return False
+    body = found.group("body").strip()
+    if not body or len(body) > _SUBHEADING_MAX_CHARS:
+        return False
+    if any(mark in body for mark in _SUBHEADING_MARKS):
+        return False
+    return not body.startswith(_ACTION_LEADING)
 
 
 @dataclass(frozen=True)
@@ -35,9 +65,13 @@ class ProjectResult:
         return {"projects": [p.model_dump(mode="json") for p in self.projects]}
 
 
-def extract_projects(raw_text: str) -> ProjectResult:
-    """从"项目经历"栏目切块。栏目不在就直说，不拿全文硬猜项目名。"""
-    lines = split_sections(raw_text).lines_of("project")
+def extract_projects(raw_text: str, *, sections: SectionMap | None = None) -> ProjectResult:
+    """从"项目经历"栏目切块。栏目不在就直说，不拿全文硬猜项目名。
+
+    `sections` 是调用方切好的栏目表（T-208：一次 parse 三个抽取器共用一份），省略则自切。
+    """
+    resolved_sections = sections if sections is not None else split_sections(raw_text)
+    lines = resolved_sections.lines_of("project")
     if not lines:
         return ProjectResult(notes=("没找到项目经历栏目，项目相关的问题只能从工作描述里找线索",))
 
@@ -108,13 +142,19 @@ def _is_wrapped_title(lines: list[str], index: int) -> bool:
 
 
 def _build_project(block: list[str], name: str) -> ProjectExperience:
-    """子标题切出来的桶：描述与技术栈拼进 `summary`，成果与编号要点拼进 `highlights`。"""
+    """子标题切出来的桶：描述与技术栈拼进 `summary`，成果与编号要点拼进 `highlights`。
+
+    编号分组标题只切桶、不入 `highlights`，也不写 `notes`：真简历的项目段普遍用这种写法，
+    为一条正常的版式惯例报流水账会把健康路径的 `errors` 变成噪音；标题本身仍在 `evidence` 里。
+    """
     summary: list[str] = []
     stack: list[str] = []
-    outcome: list[str] = []
     highlights: list[str] = []
     role: str | None = None
-    buckets: dict[SubName, list[str]] = {"summary": summary, "stack": stack, "outcome": outcome}
+    # 成果桶就是 `highlights` 本身：先前两份分别收、最后 `highlights += outcome`，
+    # 会让"编号条目在前、被换行切断的尾巴在后"，模型评审据此报"错位"（T-102 录制件第 3 条）。
+    # 归同一个列表按文档顺序收，成员不变、顺序回到原文顺序。
+    buckets: dict[SubName, list[str]] = {"summary": summary, "stack": stack, "outcome": highlights}
     bucket = summary
 
     for line in block[1:]:
@@ -128,6 +168,9 @@ def _build_project(block: list[str], name: str) -> ProjectExperience:
         if section is not None:  # 段标题混进项目段（词典把它认成了大栏目）
             continue
         if is_bullet(line):
+            if _is_numbered_subheading(text):
+                bucket = highlights  # 分组标题之后的正文跟着这一组走
+                continue
             highlights.append(text)
             continue
         if role is None and bucket is summary and text.startswith(_ROLE_PREFIXES):
@@ -135,10 +178,11 @@ def _build_project(block: list[str], name: str) -> ProjectExperience:
             continue
         bucket.append(text)
 
-    parts = ["；".join(summary)] if summary else []
+    # 桶内是"被 PDF 换行劈开的同一段话"，按换行连接判据拼；桶间（描述 / 技术栈）是真话题
+    # 边界，才用"；"。技术栈那一行的前缀也是话题标签，不属于原文。
+    parts = [join_wrapped_lines(summary)] if summary else []
     if stack:
-        parts.append(f"技术栈：{'；'.join(stack)}")
-    highlights += outcome
+        parts.append(f"技术栈：{join_wrapped_lines(stack)}")
 
     evidence = collapse(" ".join(block))[:_MAX_EVIDENCE_CHARS]
     return ProjectExperience(

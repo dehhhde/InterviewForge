@@ -22,4 +22,12 @@ async def get_task(task_id: str, session: SessionDep) -> TaskOut:
     task = await task_service.read_task(session, task_id)
     if task is None:
         raise NotFoundError("任务不存在", details={"task_id": task_id})
-    return TaskOut.model_validate(task)
+    availability = await task_service.report_availability(session, task)
+    return TaskOut.model_validate(task).model_copy(
+        update={
+            "report_status": availability.report_status,
+            "question_count": availability.question_count,
+            "degraded": availability.degraded,
+            "degraded_reason": availability.degraded_reason,
+        }
+    )

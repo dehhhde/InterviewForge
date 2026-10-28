@@ -23,7 +23,7 @@ from app.services.profile_service import (
 )
 from app.utils.llm_client import LLMClient
 
-from ._fake_llm import FakeCompletions, prompt_block
+from ._fake_llm import FakeCompletions, prompt_block, stamp
 
 _PARSED: dict[str, Any] = {
     "name": "陈昊",
@@ -161,7 +161,7 @@ async def test_prompt_version_is_left_even_when_only_the_summary_survived() -> N
 
     update = await _run(node)
 
-    assert update[PROMPT_VERSION_KEY] == "profile@v1"
+    assert update[PROMPT_VERSION_KEY] == stamp("profile")
 
 
 async def test_unnamed_sentences_are_dropped_and_the_rubric_ones_take_their_place() -> None:
@@ -290,10 +290,10 @@ async def test_prompt_carries_the_rubric_result_so_the_model_can_name_things() -
 
     await _run(node)
 
-    rubric = prompt_block(fake.user_text, "已算好的 rubric 结果")
+    rubric = prompt_block(fake.user_text, "rubric")
     assert {item["name"] for item in rubric["dimensions"]} == set(LABELS)
     assert rubric["focus_topics"]
-    gaps_block = prompt_block(fake.user_text, "JD 缺口清单")
+    gaps_block = prompt_block(fake.user_text, "gaps")
     assert {item["skill"] for item in gaps_block} == {"Java", "Redis", "Kafka"}
 
 

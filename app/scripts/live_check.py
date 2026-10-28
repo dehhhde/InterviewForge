@@ -103,7 +103,9 @@ async def main() -> None:
         second = await validate({"raw_text": first["raw_text"], "parsed": parsed})
         print(f"== validate: LLM 调用 {len(recorder.records) - before} 次")
         for issue in second["validate_issues"]:
-            print(f"   - {issue}")
+            print(f"   - [规则] {issue}")
+        for issue in second.get("reflect_issues", []):
+            print(f"   - [反思/只观测] {issue}")
         print(
             f"   repairs={second.get('errors', [])} retries={second.get('validate_retries', 0)} "
             f"prompt_version={second.get('prompt_version', '')}"

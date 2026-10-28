@@ -48,6 +48,13 @@ class Interview(ORMModel):
     #: 生命周期只有三个值，且**不由 API 传入**：`running` 是插行时的默认，
     #: `completed` / `aborted` 只在收尾写。API 层给状态字段开写入口就会造出假 completed。
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", index=True)
+    #: 这次运行的 checkpoint 归属线程（`uuid4().hex`，`start_generation` 生成、后台任务照用）。
+    #: 存它的唯一理由是**查找成本**：没有这一列，"读一份报告的图终态"必须扫全部线程、
+    #: 逐个按 `interview_id` 认（`export_report_md.py` 以前就这么干，实测 21.77MB 的库上
+    #: 每导一次都要走一遍）。旧行是空串——那些线程当初没留名字，谁也认不回来，不假装能回填。
+    thread_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default=text("''")
+    )
     #: `plan_node` 的产物（题目分布 / weak_points），整份存 JSON，理由同 `resume.parsed`。
     plan: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
     total_questions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

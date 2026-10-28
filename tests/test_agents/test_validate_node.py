@@ -8,7 +8,6 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -24,6 +23,8 @@ from app.agents.workflow import (
 from app.config import get_settings
 from app.exceptions.base import LLMError
 from app.utils.llm_client import LLMClient
+
+from ._fake_llm import FakeCompletions, stamp
 
 #: 两段都写死结束日期，年限就与"今天"无关，测试不会跨年变红
 _CLEAN_TEXT = """姓名：陈昊 13800138000
@@ -60,30 +61,10 @@ def _parsed(text: str = _CLEAN_TEXT) -> dict[str, Any]:
     }
 
 
-class _FakeCompletions:
-    """替身：按顺序吐预置回复；`raises` 非空时每次都抛那个异常。"""
-
-    def __init__(self, replies: Sequence[str], raises: Exception | None = None) -> None:
-        self.replies = list(replies)
-        self.calls: list[dict[str, Any]] = []
-        self.raises = raises
-        self.chat = SimpleNamespace(completions=self)
-
-    async def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        if self.raises is not None:
-            raise self.raises
-        text = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-        )
-
-
 def _node(
     replies: Sequence[str] = ('{"issues": []}',), raises: Exception | None = None
-) -> tuple[Any, _FakeCompletions]:
-    fake = _FakeCompletions(replies, raises)
+) -> tuple[Any, FakeCompletions]:
+    fake = FakeCompletions(replies, raises)
     settings = get_settings()
     return make_validate_node(llm=LLMClient(settings=settings, client=fake)), fake
 
@@ -93,10 +74,12 @@ async def test_a_clean_resume_lets_the_model_have_the_last_word() -> None:
 
     update = await node({"raw_text": _CLEAN_TEXT, "parsed": _parsed()})
 
-    assert update["validate_issues"] == ["work_experiences 里的公司名疑似填成了岗位名"]
-    assert update["validate_retries"] == 1, "计数由本节点自增"
+    assert update["reflect_issues"] == ["work_experiences 里的公司名疑似填成了岗位名"]
+    assert update["validate_issues"] == [], "反思不是规则问题，不进回退通道（ADR-0022）"
+    assert "validate_retries" not in update, "反思不烧 parse 的重跑预算"
+    assert update["errors"] == ["validate(reflect): work_experiences 里的公司名疑似填成了岗位名"]
     assert update["parsed"] == _parsed(), "没东西可修时原样覆盖写"
-    assert update[PROMPT_VERSION_KEY] == "validate@v1"
+    assert update[PROMPT_VERSION_KEY] == stamp("validate")
     assert len(fake.calls) == 1
 
 
@@ -107,6 +90,7 @@ async def test_the_reflection_is_only_trusted_when_it_names_a_field() -> None:
     update = await node({"raw_text": _CLEAN_TEXT, "parsed": _parsed()})
 
     assert update["validate_issues"] == []
+    assert "reflect_issues" not in update, "闸门放行零条就不必开一个空通道"
     assert "validate_retries" not in update, "没判出问题就不许计数"
 
 
@@ -216,11 +200,14 @@ async def test_the_recorded_real_reflection_only_yields_actionable_issues() -> N
 
     update = await node({"raw_text": _CLEAN_TEXT, "parsed": _parsed()})
 
-    issues = update["validate_issues"]
+    issues = update["reflect_issues"]
     assert issues, "这份真简历确实有可点名的问题"
     assert all(any(field in issue for field in _FIELDS) for issue in issues)
-    assert update["validate_retries"] == 1, "一轮只加一，不按条数加"
-    assert update[PROMPT_VERSION_KEY] == f"validate@{recorded['prompt_version']}"
+    assert update["validate_issues"] == [], "反思全归观测通道，一条都不进回退判据"
+    assert "validate_retries" not in update, "一轮反思不再烧 parse 的重跑预算"
+    # 不读录制件里的 prompt_version：那是"当时用了哪版模板"的历史事实，
+    # 而这里断的是"节点盖的是当前配置那版"——部署参数换了，这条也该照常成立
+    assert update[PROMPT_VERSION_KEY] == stamp("validate")
 
 
 def _noop(name: NodeName) -> Any:
@@ -256,3 +243,29 @@ async def test_a_dirty_resume_uses_up_the_budget_and_still_walks_to_the_end(
     assert result["validate_retries"] == agent.validate_max_retries + 1
     assert [step["node"] for step in result["trace"]][-1] == NodeName.REVIEW.value
     assert NodeName.MATCH.value in ran, "预算耗尽也要放行下游"
+
+
+async def test_reflection_issues_never_buy_a_second_parse_round(tmp_path: Path) -> None:
+    """D-4(a) 的验收〔T-201 / ADR-0022〕：规则全过、反思挑出问题时图只走一趟 parse。
+
+    分家之前这条会变成"parse 跑满 `validate_max_retries + 1` 次、每次 `parsed` 逐字相同"，
+    实测 2026-10-16 的真简历就是这么白烧了三轮。
+    """
+
+    async def parse(state: AgentState) -> Mapping[str, Any]:
+        return {"raw_text": _CLEAN_TEXT, "parsed": _parsed()}
+
+    nodes = {name: _noop(name) for name in GRAPH_NODES}
+    nodes[NodeName.PARSE] = parse
+    nodes[NodeName.VALIDATE], _ = _node(['{"issues": ["work_experiences 疑似写成了岗位名"]}'])
+
+    async with open_checkpointer(tmp_path / "ckpt.db") as saver:
+        graph = build_agent_graph(nodes, checkpointer=saver)
+        result = await graph.ainvoke({}, make_thread_config("m2-2", recursion_limit=30))
+
+    ran = [step["node"] for step in result["trace"]]
+    assert ran.count(NodeName.PARSE.value) == 1, "反思修不掉，重跑一次就是纯浪费"
+    assert "validate_retries" not in result or result["validate_retries"] == 0
+    assert result["reflect_issues"] == ["work_experiences 疑似写成了岗位名"]
+    assert result["validate_issues"] == []
+    assert [step["node"] for step in result["trace"]][-1] == NodeName.REVIEW.value

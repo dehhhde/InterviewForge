@@ -10,11 +10,14 @@ from app.services.question_service import (
     MAX_QUESTIONS_PER_ITEM,
     QuestionPayload,
     adopt_questions,
+    corpora_for,
+    evidence_problem,
     evidence_ratio,
     order_questions,
     planned_count,
     sort_key,
     to_row,
+    verify_evidence,
 )
 
 #: 所有 `evidence` 的出处。真简历里这段话是一个整行，抽取层不会切碎它
@@ -22,6 +25,9 @@ RAW = "项目经历\n使用 Redis 实现滑动窗口限流，QPS 从 800 提升�
 
 #: `source=jd` 的出处。它和简历一样是"逐字核对"的对象，不是背景描述
 JD = "岗位职责：负责高并发服务的容量规划与限流方案评审。"
+
+#: JD 里可以被逐字引用的一段
+JD_SENTENCE = "负责高并发服务的容量规划与限流方案评审"
 
 EVIDENCE = "使用 Redis 实现滑动窗口限流"
 
@@ -151,6 +157,36 @@ def test_an_unknown_source_is_treated_as_generic() -> None:
     adopted, _ = _adopt(_draft(source="resume_v2"), item={**_ITEM, "count": 1})
 
     assert adopted[0]["source"] == "generic"
+
+
+def test_the_gate_reads_exactly_the_corpora_the_fanout_packs() -> None:
+    """扇出瘦身的正确性前提：少带一份原文，绝不改变任何一题的通过与否〔T-205〕。
+
+    `route_after_generate` 用 `corpora_for` 决定每个槽位带哪份语料，`verify_evidence` 用
+    同一个判据决定拿哪份去核。所以"这一档没带的那份"在闸门眼里本来就不存在——
+    这里把它显式传成空串，判定必须和两份都给时一字不差。
+    """
+    assert corpora_for("resume") == ("raw_text",)
+    assert corpora_for("jd") == ("jd_text",)
+    #: `generic` 与任何表外来源：不声称出处，两份都核
+    assert corpora_for("generic") == corpora_for("resume_v2") == ("raw_text", "jd_text")
+
+    assert verify_evidence("resume", EVIDENCE, raw_text=RAW, jd_text="") == (EVIDENCE, None)
+    assert verify_evidence("jd", JD_SENTENCE, raw_text="", jd_text=JD) == (JD_SENTENCE, None)
+    assert verify_evidence("generic", EVIDENCE, raw_text=RAW, jd_text="") == (EVIDENCE, None)
+    assert verify_evidence("generic", JD_SENTENCE, raw_text="", jd_text=JD) == (JD_SENTENCE, None)
+
+
+def test_the_gate_ignores_the_corpus_the_source_did_not_claim() -> None:
+    """上一条的对偶：两份语料都在场时，`resume` 档也只核简历。
+
+    这是"一份判据两处用"的另一半——载荷按 `corpora_for` 清值之后，闸门的行为和清值之前
+    完全一致；反过来，载荷带全也不会让"声称基于简历"的题拿 JD 句子当出处。
+    """
+    assert evidence_problem("resume", JD_SENTENCE, raw_text=RAW, jd_text=JD) is not None
+    assert evidence_problem("jd", EVIDENCE, raw_text=RAW, jd_text=JD) is not None
+    assert evidence_problem("resume", EVIDENCE, raw_text=RAW, jd_text=JD) is None
+    assert evidence_problem("generic", EVIDENCE, raw_text=RAW, jd_text="") is None
 
 
 def test_order_index_skips_no_holes_when_a_draft_is_dropped() -> None:

@@ -6,14 +6,13 @@
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
 from app.extractors.ner_extractor import NerExtractor, extract_by_regex
 from app.parsers.pdf_parser import PdfParser
 from app.utils.llm_client import LLMClient
+from tests.test_agents._fake_llm import FakeCompletions, stamp
 
 REAL_RESUME = Path(__file__).parent.parent / "fixtures" / "resumes" / "附件简历-梁清生.pdf"
 
@@ -23,25 +22,8 @@ _LABELED = "姓名：陈昊\n电话 +86 138-0013-8000 | chen_hao@example.com\n3�
 _UNLABELED = "梁清生\n男 | 17626460250 | 3405628625@qq.com\n2年工作经验"
 
 
-class _FakeCompletions:
-    """替身：按顺序吐预置回复，记下每次 `create` 的 kwargs。"""
-
-    def __init__(self, replies: Sequence[str]) -> None:
-        self.replies = list(replies)
-        self.calls: list[dict[str, Any]] = []
-        self.chat = SimpleNamespace(completions=self)
-
-    async def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        text = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-        )
-
-
-def _extractor(replies: Sequence[str]) -> tuple[NerExtractor, _FakeCompletions]:
-    fake = _FakeCompletions(replies)
+def _extractor(replies: Sequence[str]) -> tuple[NerExtractor, FakeCompletions]:
+    fake = FakeCompletions(replies)
     return NerExtractor(llm=LLMClient(client=fake)), fake
 
 
@@ -95,7 +77,7 @@ async def test_llm_fallback_is_asked_only_for_the_gaps() -> None:
     result = await extractor.extract(_UNLABELED)
 
     assert (result.name.value, result.name.source) == ("梁清生", "llm")
-    assert result.prompt_version == "ner@v1"
+    assert result.prompt_version == stamp("ner")
     assert result.missing == ()
     assert len(fake.calls) == 1
     sent = fake.calls[0]["messages"]
@@ -181,6 +163,6 @@ async def test_replayed_real_response_passes_the_evidence_gate() -> None:
     result = await extractor.extract(raw_text)
 
     assert (result.name.value, result.name.source) == ("梁清生", "llm")
-    assert result.prompt_version == f"ner@{recorded['prompt_version']}"
+    assert result.prompt_version == stamp("ner")
     assert fake.calls[0]["model"] == recorded["model"], "回放要贴着录制时的路由"
 

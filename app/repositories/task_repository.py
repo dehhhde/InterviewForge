@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, ClassVar
+
+from sqlalchemy import select
 
 from app.models.task import Task
 from app.repositories.base import BaseRepository
@@ -50,3 +54,20 @@ class TaskRepository(BaseRepository[Task]):
         if error is not None:
             values["error"] = error
         return await self.update(id_, **values)
+
+    async def list_stale(self, *, before: datetime, statuses: Sequence[str]) -> Sequence[Task]:
+        """`updated_at` 早于 `before` 且状态在 `statuses` 里的行，按停滞时长倒序。
+
+        这是回收判据唯一的落 SQL 处（AGENTS.md §3：只有 repository 写 SQL），
+        所以它只负责"捞出来"，翻状态与提交归 `task_service.reap_stale`。
+        `statuses` 由调用方给：`pending` 算不算僵尸是产品口径，不该藏在查询里。
+        """
+        for status in statuses:
+            if status not in Task.STATUSES:
+                raise ValueError(f"未知的任务状态：{status!r}")
+        stmt = (
+            select(Task)
+            .where(Task.status.in_(statuses), Task.updated_at < before)
+            .order_by(Task.updated_at.asc())
+        )
+        return (await self.session.execute(stmt)).scalars().all()

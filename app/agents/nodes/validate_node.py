@@ -4,6 +4,10 @@
 - 只返回增量：`validate_issues` / `validate_retries` / 修正后的 `parsed`，`errors` 走只追加通道；
 - **计数由本节点自增**：判出问题才 +1，`route_after_validate` 用 `<=` 比较，
   `validate_max_retries=2` 因此等于"parse 最多重跑 3 次"；
+- **规则问题与反思问题分家**〔T-201 / ADR-0022〕：只有规则问题写 `validate_issues` 并自增计数；
+  模型挑的问题写 `reflect_issues`（纯观测）并进 `errors`。判据是"parse 能不能修"——
+  parse 是确定性的，同一份简历重跑必然给出同一个 `parsed`，所以反思问题重跑三轮也修不掉，
+  只会把预算原样烧完（实测 2026-10-16：6 条真实但 parse 修不掉的语义问题 → 整图白跑 3 轮）；
 - 不改写 `raw_text`：原始抽取结果留在 parse 那一步，回放时看的是它，不是修过的版本；
 - LLM 的意见只有点名了已知字段才算数，否则当没说过。
 
@@ -50,6 +54,7 @@ def make_validate_node(
         update: dict[str, Any] = {}
 
         issues: list[str] = []
+        reflect: list[str] = []
         if parsed is None:
             # 没有抽取结果时无从校验，也不必读模板——把话留给 parse
             issues.append("还没有抽取结果，校验无从下手")
@@ -61,11 +66,17 @@ def make_validate_node(
             # 规则还挂着就别花 LLM 的钱：让 parse 重跑之后自然还会再校验一次
             if not issues:
                 llm_issues, stamp = await _reflect(client, raw_text, outcome.parsed)
-                issues = llm_issues
+                reflect = llm_issues
                 if stamp:
                     update[PROMPT_VERSION_KEY] = stamp
 
+        # 规则问题驱动回退（可能修得掉）；反思问题只观测（parse 修不掉，ADR-0022）
         update["validate_issues"] = issues
+        if reflect:
+            update["reflect_issues"] = reflect
+            update.setdefault("errors", []).extend(
+                f"validate(reflect): {issue}" for issue in reflect
+            )
         if issues:
             update["validate_retries"] = state.get("validate_retries", 0) + 1
         return update

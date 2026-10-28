@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.extractors.base import collapse
-from app.extractors.skill_extractor import LEVEL_RANK
+from app.schemas.resume import LEVEL_RANK
 
 DimensionName = Literal[
     "skill_breadth", "skill_depth", "experience", "job_fit", "project_evidence"

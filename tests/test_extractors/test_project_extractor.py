@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.extractors.base import evidence_belongs
+from app.extractors.base import evidence_belongs, squeeze
 from app.extractors.project_extractor import extract_projects
 from app.parsers.pdf_parser import PdfParser
 
@@ -119,6 +119,76 @@ def test_the_real_resume_splits_into_two_projects_with_evidence() -> None:
     result = extract_projects(raw)
 
     assert [p.name for p in result.projects] == ["OA办公自动化系统", "对象存储中心"]
-    assert [len(p.highlights) for p in result.projects] == [17, 6]
+    # 12 = 17 行编号行 - 5 行分组标题（T-103）。第二个项目 6 行全是条目，一条没掉。
+    assert [len(p.highlights) for p in result.projects] == [12, 6]
     assert all(evidence_belongs(raw, p.evidence) for p in result.projects)
     assert all(p.summary for p in result.projects)
+
+
+def test_a_numbered_sub_header_opens_a_group_instead_of_becoming_a_highlight() -> None:
+    """`1. 权限管理体系` 是分组标题，`1、结合 RBAC 模型控制粒度` 才是成果条目。
+
+    断言只看归属：标题行不出现在 `highlights`，它后面的正文归进该桶。
+    """
+    raw = "\n".join(
+        [
+            "项目经历",
+            "OA办公自动化系统 2025.07-2026.07",
+            "核心职责与成果",
+            "1. 权限管理体系",
+            "结合 RBAC + ABAC 权限模型，支持多维度细粒度控制",
+            "2、设计自适应直传策略",
+            "对象存储中心 2025.03-2025.07",
+            "项目成果",
+            "1、支持多租户多桶管理",
+        ]
+    )
+
+    projects = extract_projects(raw).projects
+
+    assert [p.highlights for p in projects] == [
+        ["结合 RBAC + ABAC 权限模型，支持多维度细粒度控制", "2、设计自适应直传策略"],
+        ["1、支持多租户多桶管理"],
+    ]
+    assert projects[0].evidence.count("权限管理体系") == 1, "标题仍是证据的一部分，只是不当要点"
+
+
+def test_a_numbered_item_with_punctuation_stays_a_highlight() -> None:
+    """分组标题判据的反面：带句读或动作词开头的编号行是成果条目，一条都不能丢。"""
+    raw = "\n".join(
+        [
+            "项目经历",
+            "库存中心 2023.01-2023.06",
+            "核心职责与成果",
+            "1、设计自适应直传、分片上传策略选择器，并解决上下文传递",
+            "2、引入令牌桶限流",
+        ]
+    )
+
+    result = extract_projects(raw)
+
+    assert result.projects[0].highlights == [
+        "1、设计自适应直传、分片上传策略选择器，并解决上下文传递",
+        "2、引入令牌桶限流",
+    ]
+    assert result.notes == (), "正常的编号条目不该产出流水账"
+
+
+def test_the_real_resume_project_description_invents_no_punctuation() -> None:
+    """T-102 的验收（项目侧）：描述桶内的连接只补空格。
+
+    改之前这里出现过"目前服务于；本公司及母公司"与"Casdoor(用户中心)、；Springsecurity"。
+    比对像只取描述那一段——"技术栈："是这条链有意加的话题标签，本来就不在原文里。
+    """
+    if not REAL_RESUME.is_file():
+        pytest.skip("缺少真实简历样本")
+    raw = PdfParser().parse(REAL_RESUME).raw_text
+    haystack = squeeze(raw)
+
+    descriptions = [
+        (project.summary or "").split("；")[0] for project in extract_projects(raw).projects
+    ]
+
+    assert len(descriptions) == 2
+    for description in descriptions:
+        assert squeeze(description) in haystack

@@ -26,13 +26,13 @@ class QuestionSchema(BaseModel):
     follow_ups: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _check_source_evidence(self) -> "QuestionSchema":
+    def _check_source_evidence(self) -> QuestionSchema:
         if self.source == "resume" and len(self.evidence.strip()) < 4:
             raise ValueError(f"source=resume 但 evidence 不足：{self.evidence!r}")
         return self
 
     @model_validator(mode="after")
-    def _check_list_items_not_blank(self) -> "QuestionSchema":
+    def _check_list_items_not_blank(self) -> QuestionSchema:
         for label, items in (
             ("考察点", self.checkpoints),
             ("评分标准", self.rubric),

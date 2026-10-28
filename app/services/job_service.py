@@ -33,6 +33,7 @@ from app.parsers.base import ParserRegistry
 from app.parsers.docx_parser import DocxParser
 from app.parsers.image_parser import IMAGE_SUFFIXES, ImageParser
 from app.parsers.pdf_parser import PdfParser
+from app.repositories.base import keyword_filter
 from app.repositories.job_repository import JobRepository
 from app.schemas.job import JobCreateRequest, JobDraftOut, JobUpdateRequest
 from app.utils.llm_client import LLMClient
@@ -146,9 +147,17 @@ async def read_jd_file(*, file_name: str, data: bytes) -> str:
 
 
 async def list_jobs(
-    session: AsyncSession, *, limit: int = 50, offset: int = 0
-) -> Sequence[Job]:
-    return await JobRepository(session).list(limit=limit, offset=offset)
+    session: AsyncSession, *, limit: int = 50, offset: int = 0, q: str = ""
+) -> tuple[Sequence[Job], int]:
+    """一页岗位 + **同一条件下**的总行数〔T-303〕。
+
+    搜索列只有 `title` / `company`（岗位的自然键两半），不带 `jd_text`：那是正文，
+    对它做 LIKE 既没有索引可依，又会把"搜'后端'"变成"搜所有写过'后端'两字的 JD"。
+    """
+    repository = JobRepository(session)
+    filters = keyword_filter(Job, q, ("title", "company"))
+    rows = await repository.list(limit=limit, offset=offset, filters=filters)
+    return rows, await repository.count(filters=filters)
 
 
 async def get_job(session: AsyncSession, job_id: str) -> Job | None:

@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.dialects import sqlite
 
 from app.models.resume import Resume
+from app.repositories.base import contains, keyword_filter
 from app.repositories.resume_repository import ResumeRepository
 
 
@@ -104,3 +106,49 @@ async def test_update_and_delete_report_a_missing_row(session) -> None:
 async def test_model_columns_are_the_whitelist_source(session) -> None:
     """`column_names()` 与真实列一一对应，白名单才不会随着加列而失真。"""
     assert set(Resume.column_names()) == {c.key for c in Resume.__table__.columns}
+
+
+# --- 关键词条件构造器（T-303）---
+
+
+def test_keyword_filter_uses_the_same_column_whitelist_as_order_by() -> None:
+    """列名是第二处"字符串来自调用方却参与 SQL 构造"，所以它不许比 `order_by` 松。"""
+    for hostile in ("password", "__table__", "raw_text; drop table resume"):
+        with pytest.raises(ValueError, match="无列"):
+            keyword_filter(Resume, "林可", (hostile,))
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"], ids=["empty", "spaces", "tab"])
+def test_a_blank_keyword_builds_no_condition(blank: str) -> None:
+    """空关键词返回**空条件**而不是 `LIKE '%%'`：后者会让 SQLite 逐行做一次无用的模式匹配。"""
+    assert keyword_filter(Resume, blank, ("name",)) == ()
+
+
+def test_contains_escapes_every_like_metacharacter() -> None:
+    r"""编译出来的模式串里三个通配符都得带转义符，且 SQL 显式声明 `ESCAPE`。
+
+    这条不看数据、只看形状：行为用例（`test_list_filter_api.py`）能证明"搜 `%` 没命中全部"，
+    但证不了"反斜杠本身也转义了"——库里得真有一行写着 `\%` 才看得出差别，而那种行本来就该测。
+    """
+    clause = contains(Resume.name, "a\\b%c_d")
+    compiled = clause.compile(dialect=sqlite.dialect())
+    pattern = list(compiled.params.values())[0]
+
+    assert pattern == "%a\\\\b\\%c\\_d%"
+    assert "ESCAPE" in str(compiled)
+
+
+async def test_count_matches_a_filtered_list_exactly(session) -> None:
+    """`total` 与 `items` 同源的机器版本：同一份 `filters` 交给两者，数字必须对得上。
+
+    这条看着像废话，但它是这张卡唯一能机器证明的事——服务层一旦给 `count` 换了条件
+    （比如忘了传 `filters`），页脚就会开始报全表行数。
+    """
+    repo = ResumeRepository(session)
+    for name in ("林可", "小林可", "周砚"):
+        await repo.create(name=name, raw_text="A")
+    filters = keyword_filter(Resume, "林可", ("name", "file_name"))
+    rows = await repo.list(filters=filters)
+    assert len(rows) == 2
+    assert await repo.count(filters=filters) == len(rows)
+    assert await repo.count() == 3

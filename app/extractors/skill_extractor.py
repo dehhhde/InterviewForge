@@ -16,8 +16,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
 from app.extractors.base import collapse
-from app.extractors.sections import split_sections
-from app.schemas.resume import SkillItem, SkillLevel
+from app.extractors.sections import SectionMap, split_sections
+from app.schemas.resume import LEVEL_RANK, SkillItem, SkillLevel
 
 #: 别名（小写比对）-> 展示用正名。紧凑写法与带空格写法都收，命中哪个都归到同一个名字。
 SKILL_ALIASES: dict[str, str] = {
@@ -136,8 +136,6 @@ LEVEL_WORDS: dict[str, SkillLevel] = {
     "了解": "basic",
     "会用": "basic",
 }
-#: 档位高低，供" JD 要精通、简历只写熟悉"这类比较复用（`match_service` 用它判 partial）
-LEVEL_RANK: dict[str, int] = {"basic": 0, "familiar": 1, "proficient": 2}
 
 #: 短到会成为英文碎片的别名，必须原样大小写命中（否则正文里小写的 "go" 也算一门语言）
 _CASE_SENSITIVE = {"go", "r", "c"}
@@ -168,10 +166,13 @@ class SkillResult:
         return {"skills": [s.model_dump(mode="json") for s in self.skills]}
 
 
-def extract_skills(raw_text: str) -> SkillResult:
-    """优先只扫"专业技能"栏目；没有该栏目时退回全文，并把退回这件事写进 notes。"""
-    sections = split_sections(raw_text)
-    lines = [collapse(line) for line in sections.lines_of("skills")]
+def extract_skills(raw_text: str, *, sections: SectionMap | None = None) -> SkillResult:
+    """优先只扫"专业技能"栏目；没有该栏目时退回全文，并把退回这件事写进 notes。
+
+    `sections` 是调用方切好的栏目表（T-208：一次 parse 三个抽取器共用一份），省略则自切。
+    """
+    resolved_sections = sections if sections is not None else split_sections(raw_text)
+    lines = [collapse(line) for line in resolved_sections.lines_of("skills")]
     notes: list[str] = []
     if not lines:
         lines = [collapse(line) for line in raw_text.splitlines()]
@@ -257,13 +258,23 @@ def _overlaps(span: tuple[int, int], taken: Sequence[tuple[int, int]]) -> bool:
 
 
 def _level_before(line: str, index: int) -> SkillLevel | None:
-    """技能名左边最近的程度词。"""
-    best: tuple[int, SkillLevel] | None = None
+    """技能名左边最近的程度词；右端齐平时取更长的词。
+
+    只比起点会选错：`熟练运用 MySQL` 里 `运用`(basic) 的起点比 `熟练运用`(familiar)
+    更靠右，于是"熟练运用"被判成 basic。而 match 的档位与 rubric 的 `skill_depth`
+    共用这一处判据——词表内部的包含关系就能把整份画像的难度带低。
+    比"右端离技能名更近、同右端取更长"才是人读这句话的读法：`熟练运用` 与 `运用`
+    右端相同，长的那条信息量大。
+    """
+    best: tuple[tuple[int, int], SkillLevel] | None = None
     head = line[:index]
-    for word in LEVEL_WORDS:
+    for word, level in LEVEL_WORDS.items():
         position = head.rfind(word)
-        if position >= 0 and (best is None or position > best[0]):
-            best = (position, LEVEL_WORDS[word])
+        if position < 0:
+            continue
+        key = (position + len(word), len(word))
+        if best is None or key > best[0]:
+            best = (key, level)
     return best[1] if best else None
 
 

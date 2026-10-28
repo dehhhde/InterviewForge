@@ -7,12 +7,17 @@
 """
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 Degree = Literal["college", "bachelor", "master", "phd", "other"]
 SkillLevel = Literal["basic", "familiar", "proficient"]
+
+#: 档位高低，"哪个技能写得更强"的唯一判据。放这里而不是抽取层：本文件的 `_richer`
+#: （重复合并）与抽取层、`match_service`（"JD 要精通、简历只写熟悉"）、`profile_service`
+#: （`skill_depth` 分档）四处都要用它，而 schema 反向 import 抽取器就成环了。
+LEVEL_RANK: dict[str, int] = {"basic": 0, "familiar": 1, "proficient": 2}
 
 DEGREE_ALIASES: dict[str, Degree] = {
     "大专": "college",
@@ -22,6 +27,14 @@ DEGREE_ALIASES: dict[str, Degree] = {
     "硕士": "master",
     "研究生": "master",
     "博士": "phd",
+    # 在职学位的两种写法：字样归抽取层认，档位归这里定，否则它们会被静默归档成 other
+    # 并让 M2 的枚举规则误报（AGENTS.md §5：宁可缺失，不许编造——但认得出的不该报）。
+    "MBA": "master",
+    "EMBA": "master",
+    # 中等学历：`Degree` 枚举只到专科，所以它们**合法地**落在 other——
+    # 收进别名表的目的是让校验层知道"这是认出来的，不是漏抽的"，别再为此报 issue。
+    "中专": "other",
+    "高中": "other",
 }
 _LEVEL_ALIASES: dict[str, SkillLevel] = {
     "了解": "basic",
@@ -63,11 +76,13 @@ class EducationItem(BaseModel):
     def _normalize_degree(cls, value: object) -> object:
         if isinstance(value, str):
             text = value.strip()
-            return DEGREE_ALIASES.get(text, text if text in DEGREE_ALIASES.values() else "other")
+            # 拉丁学位按大写查：模型与 OCR 都会回 `mba`/`Mba`，大小写不该变成"认不出"
+            key = text.upper() if text.isascii() else text
+            return DEGREE_ALIASES.get(key, key if key in DEGREE_ALIASES.values() else "other")
         return value
 
     @model_validator(mode="after")
-    def _check_year_order(self) -> "EducationItem":
+    def _check_year_order(self) -> EducationItem:
         if (
             self.start_year is not None
             and self.graduate_year is not None
@@ -89,7 +104,7 @@ class WorkExperience(BaseModel):
     evidence: str = Field(min_length=2)
 
     @model_validator(mode="after")
-    def _check_date_order(self) -> "WorkExperience":
+    def _check_date_order(self) -> WorkExperience:
         if self.start is not None and self.end is not None and self.start > self.end:
             raise ValueError(f"工作时间倒挂：{self.start} 晚于 {self.end}")
         return self
@@ -141,17 +156,26 @@ class ResumeSchema(BaseModel):
 
 
 def _richer(left: SkillItem, right: SkillItem) -> SkillItem:
+    """同一技能的两条记录留更强的那条：先比档位，同档再比年限。
+
+    为什么不能只比 `years`：抽取器从不填它（"缺失优于瞎猜"写在上面对它的注释里），
+    于是比较恒等于 `平手 → 留左边`，合并结果就是"LLM 先说的那条"——
+    `[Java(了解), Java(精通)]` 会留下 `了解`，把画像和难度分档一起带低。
+    """
+    left_level = LEVEL_RANK.get(left.level or "", -1)
+    right_level = LEVEL_RANK.get(right.level or "", -1)
+    if left_level != right_level:
+        return right if right_level > left_level else left
     left_years = left.years if left.years is not None else -1
     right_years = right.years if right.years is not None else -1
     return right if right_years > left_years else left
 
 
-class ResumeOut(BaseModel):
-    """`GET /resumes/{id}` 的读取 DTO（M6）。
+class ResumeFields(BaseModel):
+    """简历的**列表行与详情共用**的列，字段名只在这里声明一次〔T-301 / OPT-6.1〕。
 
-    `parsed` 按原样透传抽取 JSON，不重新套 `ResumeSchema`：库里存的形状是当年通过校验的
-    那份 dump，而 `ResumeSchema` 还在长（M1/M2 加过 `dropped`、别名表）——用今天的 schema
-    回读昨天的行，等于让 schema 变更把历史数据判成脏数据。
+    拆成两份平行模型是这张卡明确禁止的做法：加一列要改两处，漏一处就出现"列表里有、详情没有"
+    的字段，而页面会拿它当真相。继承让详情多带的那一列必须被显式命名，共用列则无法各写一遍。
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -159,8 +183,78 @@ class ResumeOut(BaseModel):
     id: str
     file_name: str
     name: str
-    parsed: dict[str, Any]
     created_at: datetime
+
+
+#: 概览里带几个技能名：列表页与出题下拉都只渲染前 8 个，多发的部分是白占带宽。
+SKILL_PREVIEW_LIMIT = 8
+
+
+class ResumeOverview(BaseModel):
+    """列表行的抽取概览：三个数 + 前几项技能名。
+
+    它是从 `parsed` **当场算出来的**，不在 `resume` 表上存副本——表里加一列 `skill_count`
+    就是第二份真相（`app/models/resume.py` 对 `years_experience` 明确拒过这种复制）。
+    """
+
+    skill_count: int = 0
+    #: 只前 `SKILL_PREVIEW_LIMIT` 项；逐条技能（含证据）在 `GET /resumes/{id}` 给。
+    skill_names: list[str] = Field(default_factory=list)
+    years_experience: float | None = None
+    work_experience_count: int = 0
+
+
+def build_overview(parsed: dict[str, Any]) -> ResumeOverview:
+    """`parsed` → 概览。历史行的键可能比今天的 schema 少，所以逐项容错而不是套 `ResumeSchema`。
+
+    算不出的就留默认值：概览是展示用的，把"这一行没有年限"报成 500 或 0 都比"没抽出来"更糟。
+    """
+    skills = parsed.get("skills")
+    work = parsed.get("work_experiences")
+    years = parsed.get("years_experience")
+    names = [
+        str(item["name"])
+        for item in (skills if isinstance(skills, list) else [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    return ResumeOverview(
+        skill_count=len(skills) if isinstance(skills, list) else 0,
+        skill_names=names[:SKILL_PREVIEW_LIMIT],
+        years_experience=float(years) if isinstance(years, (int, float)) else None,
+        work_experience_count=len(work) if isinstance(work, list) else 0,
+    )
+
+
+class ResumeListItem(ResumeFields):
+    """`GET /resumes/list` 的行：共用列 + 概览，**不带 `parsed` 正文**〔T-301〕。
+
+    列表 DTO 与详情 DTO 原本是同一个模型，于是一页 50 行把 skills/educations/work/projects
+    连同每条 `evidence` 全量下发（BACKLOG P3-14）。列表页要的是"几项技能、几年经验"，
+    正文明细在 `GET /resumes/{id}` 给。
+    """
+
+    overview: ResumeOverview = Field(default_factory=ResumeOverview)
+
+    @classmethod
+    def from_row(cls, row: Any) -> Self:
+        """共用列取 `ResumeFields` 的字段表，这里不重列列名；概览从 `parsed` 现算。
+
+        `row` 是 `Resume` ORM 行，但 schema 反向 import models 会搅乱 §3 的分层方向，
+        所以按属性取而不是按类型取。
+        """
+        shared = {key: getattr(row, key) for key in ResumeFields.model_fields}
+        return cls(**shared, overview=build_overview(dict(row.parsed or {})))
+
+
+class ResumeOut(ResumeFields):
+    """`GET /resumes/{id}` 的读取 DTO（M6）：共用列 + 抽取结果全文。
+
+    `parsed` 按原样透传抽取 JSON，不重新套 `ResumeSchema`：库里存的形状是当年通过校验的
+    那份 dump，而 `ResumeSchema` 还在长（M1/M2 加过 `dropped`、别名表）——用今天的 schema
+    回读昨天的行，等于让 schema 变更把历史数据判成脏数据。
+    """
+
+    parsed: dict[str, Any]
 
 
 class UploadOut(BaseModel):

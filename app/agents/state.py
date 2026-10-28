@@ -75,12 +75,28 @@ class AgentState(TypedDict, total=False):
     #: 报告头 id。由调用方（API / 后台任务 / 脚本）在建好 `interview` 行后传入；
     #: `review` 收尾按它落库。缺省时收尾跳过落库并记进 `errors`——那是"调用方没打算入库"。
     interview_id: str
+    #: 定向重做的**显式授权**〔T-404〕：`true` 才允许 `review` 之后回一次 `generate`，
+    #: 且最多一轮（批次号 `== 1` 才路由回去）。它不是阈值——没有任何"批注占比多少才修"
+    #: 的判定住在这里，那是 ADR-0015 删掉的东西。默认 `false` = 一次成卷的既有行为。
+    auto_fix: bool
 
     # --- parse / validate ---
     raw_text: str
     parsed: dict[str, Any] | None
     validate_issues: list[str]
     validate_retries: int
+    #: 模型反思挑出的问题〔T-201 / ADR-0022〕：**纯观测**，不进回退计数。
+    #: 与 `validate_issues` 的差别不是"严重程度"而是"parse 能不能修"：规则层判的是结构自洽
+    #: （倒挂、越界、无出处），重抽一次有可能变；模型挑的是抽取层的设计缺口，parse 是确定性的，
+    #: 重跑只会给出逐字相同的 `parsed`。分家之前，一条反思会把 `validate_max_retries`
+    #: 原样烧完再放行（实测 3 轮同一句话）。
+    reflect_issues: list[str]
+    #: 正文的"出处指纹"（T-013）：`parse` 读的是哪个文件（mtime+size）、由哪个解析器读出、
+    #: 那份正文带不带模板署名。回退重进 `parse` 时靠这三样判断"文件没换 → 不必重读、
+    #: 更不必重跑 OCR"；只给 `raw_text` 是不够的——扫描件重 OCR 一次就是真金白银。
+    source_stamp: str
+    source_parser: str
+    source_prompt_version: str
 
     # --- match / profile / plan ---
     matched_gaps: list[dict[str, Any]]
@@ -97,6 +113,11 @@ class AgentState(TypedDict, total=False):
     questions: Annotated[list[dict[str, Any]], operator.add]
     #: 批次号，`generate` 每次扇出自增 1。收尾落库时写进 `question.batch`
     question_batch: int
+    #: 本轮的扇出计划〔T-404〕：`generate` 节点算好（第一轮 = 整卷槽位，定向重做轮 =
+    #: 被点名的槽位，每项带上一版的 `previous`），`route_after_generate` 只照它打包 `Send`。
+    #: 为什么走通道而不是让路由自己从 `plan` 推：两轮要推的东西不一样，而"谁被点名"的判据
+    #: 只许写在一处（`services/redo_service`）——节点算完把结果交给通道，路由读结果。
+    fanout_slots: list[dict[str, Any]]
     #: 纯观测：ADR-0015 起批注不再驱动路由，只标出"哪几题有问题"，题目一律照常落库
     review_issues: list[dict[str, Any]]
 

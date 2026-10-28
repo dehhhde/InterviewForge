@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.extractors.base import collapse, evidence_belongs, squeeze
-from app.extractors.skill_extractor import LEVEL_RANK, SkillMention, skill_mentions_in
+from app.extractors.skill_extractor import SkillMention, skill_mentions_in
+from app.schemas.resume import LEVEL_RANK
 
 GapLevel = Literal["matched", "partial", "missing", "unverified"]
 SectionName = Literal["required", "preferred", "duty"]

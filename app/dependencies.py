@@ -1,8 +1,9 @@
 """依赖注入：get_db / get_llm / get_current_user / get_page_params〔阶段 2 · §5.3〕
 
 这里只做**装配**：进程级的引擎单例 + 会话工厂 + `get_db` 依赖 + HTTP 侧的 LLM 客户端。
-`get_current_user` 与 `get_page_params` 属认证与分页，等 M4 的 API 层落地再补——
-现在写了也没有调用点，只会变成"看起来有人用"的死代码。
+`get_current_user` 属认证，仍等 M4 之后的多租户决议（`docs/TASK_PLAN.md` D-7）再补；
+分页参数从"一个依赖函数"改成了两个 `Annotated` 别名（见文件末尾），因为三个列表端点
+要的只是同一对区间约束，没有运行期装配可言。
 
 引擎必须是单例：`build_engine` 会注册 connect 事件监听并打开 WAL，一个进程里建两台引擎
 就是两套连接池去抢同一个 SQLite 文件（单写者），而 `busy_timeout` 只让第二个池排队等待。
@@ -15,7 +16,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Query
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -88,7 +89,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_db)]
 SessionMakerDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionmaker)]
 
 
-def get_llm() -> LLMClient:
+async def get_llm() -> AsyncIterator[LLMClient]:
     """HTTP 侧的 LLM 客户端装配点。与引擎不同，它**每次请求新建**，原因有两条：
 
     - 客户端里的 `Semaphore` 与 `UsageTotals` 都是"一次运行"的量纲。缓存成进程单例，
@@ -96,9 +97,31 @@ def get_llm() -> LLMClient:
     - 测试要换替身。走 `app.dependency_overrides[get_llm]` 比 monkeypatch 服务层内部干净，
       和 `tests/test_api/` 现有的夹具同形。
 
+    每请求新建的代价是连接池没人关，所以它是 async generator 依赖：请求收尾时在
+    `finally` 里 `aclose()`（T-011 / BACKLOG P1-6）。**不许改回缓存单例。**
+
     分层铁律照旧：节点、服务与抽取器内部都不自己 new client，装配期把它传下去。
     """
-    return LLMClient(get_settings())
+    client = LLMClient(get_settings())
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 LLMDep = Annotated[LLMClient, Depends(get_llm)]
+
+#: 列表端点的分页参数（BACKLOG P0-3）。区间本身就是 API 契约，不是行为配置，所以写死在
+#: 这里而不是 `configs/*.yaml`：客户端要的是"这个接口最多给 200 条"的稳定承诺。
+#: 为什么非挡不可：实测 SQLite 的 `LIMIT -1` 返回全表，一个 `?limit=-1` 就绕过了分页；
+#: 上限则挡掉 `?limit=1000000` 这种把整库连 `parsed` JSON 一起拉走的读法。
+PageLimit = Annotated[int, Query(ge=1, le=200)]
+PageOffset = Annotated[int, Query(ge=0, le=10000)]
+
+#: 列表端点的关键词参数〔T-303 / OPT-6.3〕。默认值**写在端点签名上**（`q: KeywordQuery = ""`），
+#: 这里不给 `Query` 带 `default`：与 `PageLimit` 同形，而且 FastAPI 在 `Annotated` 里检测到
+#: 带默认值的 `Query` 会当场断言失败（实测：`default value cannot be set in Annotated`）。
+#: 空串 = 不加条件，所以服务层不需要判 None。
+#: 上限 64 字挡的不是性能而是用法：这是"姓名/岗位名/文件名"级别的搜索，
+#: 把整段简历贴进来只会得到一个 0 条的结果，而用户会以为搜索坏了。
+KeywordQuery = Annotated[str, Query(max_length=64)]

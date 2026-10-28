@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
@@ -18,13 +18,14 @@ import EmptyBlock from '@/components/EmptyBlock.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import ReportViewer from '@/components/ReportViewer.vue'
 import StatusPill from '@/components/StatusPill.vue'
+import { downloadReportMarkdown } from '@/utils/download'
 import {
   DIFFICULTY_LABEL,
   formatDateTime,
   reportPairLabel,
   shortId,
 } from '@/utils/format'
-import { downloadMarkdown } from '@/utils/markdown'
+import { REFRESH_INTERVAL_MS } from '@/utils/task'
 
 const route = useRoute()
 const router = useRouter()
@@ -33,7 +34,6 @@ const report = ref<Interview | null>(null)
 const loading = ref(true)
 const notFound = ref(false)
 const errorMessage = ref('')
-const exporting = ref(false)
 
 const quotas = computed(() => {
   const source = report.value?.plan?.difficulty_quotas ?? {}
@@ -51,6 +51,13 @@ async function load(): Promise<void> {
   errorMessage.value = ''
   try {
     report.value = await getInterview(id)
+    // 列表页的「打印」把动作挂在 query 上〔T-306〕：卷子的排版规则只有这一页知道，
+    // 所以列表只负责"带去这里并立刻出纸"，不自己复刻一套打印样式。
+    if (route.query.print === '1') {
+      await clearPrintQuery()
+      await nextTick()
+      window.print()
+    }
   } catch (error) {
     report.value = null
     if (isApiFailure(error) && error.status === 404) {
@@ -64,14 +71,17 @@ async function load(): Promise<void> {
   }
 }
 
-async function exportMarkdown(): Promise<void> {
+/** 打印意图消费掉就抹掉：留在地址栏里，之后每次刷新/前进后退都会再出一次纸。 */
+async function clearPrintQuery(): Promise<void> {
+  const query = { ...route.query }
+  delete query.print
+  await router.replace({ path: route.path, query })
+}
+
+function exportMarkdown(): void {
   if (!report.value) return
-  exporting.value = true
-  try {
-    downloadMarkdown(report.value)
-  } finally {
-    exporting.value = false
-  }
+  // 内容出自服务端那一份渲染（`GET /interviews/{id}/export.md`），前端不再拼 Markdown。
+  downloadReportMarkdown(report.value.id)
 }
 
 function printReport(): void {
@@ -99,7 +109,7 @@ onMounted(() => {
       <template #actions>
         <el-button :icon="ArrowLeft" @click="router.push('/reports')">返回列表</el-button>
         <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
-        <el-button :icon="Download" :disabled="!report" :loading="exporting" @click="exportMarkdown">
+        <el-button :icon="Download" :disabled="!report" @click="exportMarkdown">
           导出 Markdown
         </el-button>
         <el-button type="primary" :icon="Printer" :disabled="!report" @click="printReport">
@@ -124,7 +134,7 @@ onMounted(() => {
       </EmptyBlock>
     </div>
 
-    <div v-else-if="errorMessage" class="card">
+    <div v-else-if="errorMessage" class="card" role="alert">
       <EmptyBlock
         :icon="WarningFilled"
         title="读取报告失败"
@@ -235,9 +245,11 @@ onMounted(() => {
 
       <div v-if="report.status === 'running'" class="alert-inline info">
         <strong>这份报告仍在生成中。</strong>
-        题目由评审收尾一次性落库，完成前题目列表为空是正常状态；页面每 2 秒轮询的后台任务仍在跑。
+        题目由评审收尾一次性落库，完成前题目列表为空是正常状态。这一页不会自己轮询，
+        要更新点「刷新」；报告列表页对运行中的报告每
+        {{ REFRESH_INTERVAL_MS / 1000 }} 秒静默刷新一次。
       </div>
-      <div v-else-if="report.status === 'aborted'" class="alert-inline warn">
+      <div v-else-if="report.status === 'aborted'" class="alert-inline warn" role="alert">
         <strong>后台任务没跑到收尾。</strong>
         上游报错或成本护栏触发，库里因此没有题目行；批注只能说明哪些题该改，不能解释为什么没有题。
       </div>

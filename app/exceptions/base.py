@@ -49,6 +49,17 @@ class ConflictError(AppError):
     code = "already_exists"
 
 
+class PayloadTooLargeError(AppError):
+    """上传体超过 `upload.*_bytes` 上限（BACKLOG P0-2）。
+
+    413 而不是 422：422 说"内容不合法"，413 说"这个尺寸的服务端不接受"——
+    客户端据此做的第一件事是压缩或换原件，而不是改文件名重试。
+    """
+
+    status_code = 413
+    code = "upload_too_large"
+
+
 class ParseError(AppError):
     """简历文件读不出文本，属于请求内容问题。"""
 

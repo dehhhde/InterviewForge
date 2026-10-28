@@ -7,9 +7,14 @@
 - 传输重试（tenacity）：连接错误 / 超时 / 限流，同一条 messages 重发。
 - 校验重试（chat_json 内部）：模型答非所问，把错误反馈拼回对话再问，次数由
   `validate_max_retries` 约束。
+
+两者相乘就是"一个逻辑调用最多 `transport_max_attempts × 校验轮数` 次 HTTP"，所以另有一条
+**总时限**（`llm.retry_deadline_seconds`）给相乘的结果封顶，以及回灌截断
+（`llm.refeed_max_chars`）——它们不是第三层重试，只是给最坏情况定价〔T-206〕。
 """
 
 import asyncio
+import inspect
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -76,6 +81,7 @@ class LLMClient:
         self.settings = settings or get_settings()
         self.usage = UsageTotals()
         self._sem = asyncio.Semaphore(self.settings.llm.max_concurrency)
+        self._closed = False
         self._client = client or AsyncOpenAI(
             api_key=self.settings.deepseek_api_key.get_secret_value(),
             base_url=self.settings.deepseek_base_url,
@@ -113,9 +119,15 @@ class LLMClient:
             kwargs["response_format"] = {"type": "json_object"}
         resp: Any = None
         try:
-            async with self._sem:
-                async for attempt in self._retrying():
-                    with attempt:
+            # 信号量包住**一次尝试**而不是整个重试循环〔T-207 / BACKLOG P2「信号量粒度」〕。
+            # 包在外面的话，指数退避那几秒（最长 ~8s）也占着一个槽：`max_concurrency=4` 时
+            # 上游一限流，四个槽全在睡觉，出题的二十几个分支只能干等。
+            # 语义变化要想清楚：同一个逻辑调用在不同尝试上各占一次槽，
+            # 也就是说"并发上限"约束的是**在途请求数**，而不是"同时进行几个逻辑调用"——
+            # 前者才是我们要挡的东西（连接池与上游 QPS），后者只是它的副产品。
+            async for attempt in self._retrying():
+                with attempt:
+                    async with self._sem:
                         resp = await self._client.chat.completions.create(**kwargs)
         except _TRANSPORT_RETRYABLE as exc:
             self.usage.failed_calls += 1
@@ -158,31 +170,47 @@ class LLMClient:
 
         返回 `dict`（未给 schema）或 schema 实例。重试用尽仍不合格抛
         `LLMResponseError`——注意它与 `LLMError` 不同：上游是通的，产出不可用。
+
+        整段循环套一条**墙钟总时限**（`llm.retry_deadline_seconds`）〔T-206〕：越线时
+        抛 `LLMError`（`code="llm_timeout"`）而不是 `LLMResponseError`——前者说"没等到答案"，
+        后者说"等到了但不合格"，客户端看到 `status_code` 之后做的事不一样。
         """
         attempts = (
             max_attempts
             if max_attempts is not None
             else self.settings.agent.validate_max_retries + 1
         )
+        deadline = self.settings.llm.retry_deadline_seconds
+        refeed_limit = self.settings.llm.refeed_max_chars
         payload = list(messages)
         last_error = "未产出内容"
-        for _ in range(attempts):
-            raw = await self.chat(purpose, payload, temperature=temperature, json_mode=True)
-            try:
-                data = _parse_json(raw)
-                if schema is None:
-                    return data
-                return schema.model_validate(data)
-            except (ValueError, json.JSONDecodeError, ValidationError) as exc:
-                last_error = _brief_error(exc)
-                payload = [
-                    *payload,
-                    {"role": "assistant", "content": raw},
-                    {
-                        "role": "user",
-                        "content": f"上次输出不合格：{last_error}。只重新输出修正后的 JSON。",
-                    },
-                ]
+        rounds = 0
+        try:
+            async with asyncio.timeout(deadline):
+                for _ in range(attempts):
+                    rounds += 1
+                    raw = await self.chat(purpose, payload, temperature=temperature, json_mode=True)
+                    try:
+                        data = _parse_json(raw)
+                        if schema is None:
+                            return data
+                        return schema.model_validate(data)
+                    except (ValueError, json.JSONDecodeError, ValidationError) as exc:
+                        last_error = _brief_error(exc)
+                        # 回灌的是**截断后**的原文〔T-206〕：要改的是结构，而结构错误在前几百字
+                        # 就看得见，整份重发等于替它把刚写的预算再花一遍
+                        hint = f"上次输出不合格：{last_error}。只重新输出修正后的 JSON。"
+                        payload = [
+                            *payload,
+                            {"role": "assistant", "content": _clip(raw, refeed_limit)},
+                            {"role": "user", "content": hint},
+                        ]
+        except TimeoutError as exc:
+            raise LLMError(
+                f"模型调用超过总时限 {deadline}s（第 {rounds}/{attempts} 轮未完成）",
+                code="llm_timeout",
+                details={"attempts": rounds},
+            ) from exc
         raise LLMResponseError(
             f"模型连续 {attempts} 次未产出合规 JSON",
             details={"attempts": attempts, "last_error": last_error},
@@ -193,6 +221,23 @@ class LLMClient:
         prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
         completion = int(getattr(usage, "completion_tokens", 0) or 0)
         self.usage.record(model, prompt, completion)
+
+    async def aclose(self) -> None:
+        """关闭底层 `AsyncOpenAI` 的连接池〔T-011 / BACKLOG P1-6〕。
+
+        客户端每请求新建（`Semaphore`/`UsageTotals` 是"一次运行"的量纲），不关就只能靠 GC。
+        幂等：重复调用不再触碰底层。测试注入的假件多半没有 `aclose`，有 `close` 就用
+        `close`，两者都没有就只记关闭标记。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        closer = getattr(self._client, "aclose", None) or getattr(self._client, "close", None)
+        if closer is None:
+            return
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
 
 
 def _extract_text(resp: Any) -> str:
@@ -212,6 +257,17 @@ def _parse_json(raw: str) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise ValueError(f"期望 JSON 对象，得到 {type(loaded).__name__}")
     return loaded
+
+
+def _clip(text: str, limit: int) -> str:
+    """截断回灌给模型的上一轮输出，截断处留一个显式记号〔T-206〕。
+
+    记号不是装饰：不标出来，模型会认为自己上次交的就是完整一份，于是去修结尾的括号，
+    而真正缺的东西在它看不见的后半段。
+    """
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n……（此处已截断，请按下面的说明重新输出完整 JSON）"
 
 
 def _brief_error(exc: Exception) -> str:

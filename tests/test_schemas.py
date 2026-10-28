@@ -88,6 +88,40 @@ def test_resume_merges_duplicate_skills_keeping_richer() -> None:
     assert (resume.skills[0].level, resume.skills[0].years) == ("proficient", 5)
 
 
+def test_resume_merges_duplicate_skills_by_level_when_years_is_missing() -> None:
+    """抽取器从不填 `years`，所以重复合并必须先比档位〔T-007〕
+
+    旧实现只比 `years`（None 记 -1）⇒ 比较恒等于"平手留左边"，合并结果就是
+    "LLM 先说的那条"：`[Java(了解), Java(精通)]` 留下 `了解`，把画像与难度分档一起带低。
+    """
+    resume = ResumeSchema.model_validate(
+        _resume_payload(
+            skills=[
+                SkillItem(name="Java", level="basic", evidence="了解 Java 语法"),
+                # 大小写混拼按同一条合并（`_merge_duplicate_skills` 按小写名归键）
+                SkillItem(name="java", level="proficient", evidence="精通 Java 并发"),
+            ]
+        )
+    )
+    assert len(resume.skills) == 1
+    assert resume.skills[0].level == "proficient"
+    assert resume.skills[0].years is None
+
+
+def test_resume_keeps_the_longer_years_when_the_levels_tie() -> None:
+    """同档再比年限：这条是旧实现唯一走得通的来路，别因为改了主判据就把它换掉。"""
+    resume = ResumeSchema.model_validate(
+        _resume_payload(
+            skills=[
+                SkillItem(name="Redis", level="familiar", evidence="熟悉 Redis"),
+                SkillItem(name="Redis", level="familiar", years=4, evidence="熟悉 Redis 持久化"),
+            ]
+        )
+    )
+    assert len(resume.skills) == 1
+    assert (resume.skills[0].level, resume.skills[0].years) == ("familiar", 4)
+
+
 def test_question_accepts_evidenced_resume_question() -> None:
     question = QuestionSchema.model_validate(
         {

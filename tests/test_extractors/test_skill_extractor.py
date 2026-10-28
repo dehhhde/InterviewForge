@@ -64,6 +64,33 @@ def test_the_whole_text_is_scanned_when_there_is_no_skills_section() -> None:
     assert any("技能栏目" in note for note in result.notes)
 
 
+def test_a_longer_degree_word_beats_its_own_suffix_when_they_end_together() -> None:
+    """`熟练运用` 里的 `运用` 与整词在同处以右端收口：并列时比长度〔T-006〕
+
+    旧判据只比起点，起点更晚的 `运用`(basic) 就赢了整词 `熟练运用`(familiar)，
+    档位被读低一级；这处判据同时供 match 档位与 rubric 的 `skill_depth` 用。
+    """
+    result = extract_skills("专业技能\n熟练运用 MySQL")
+
+    assert _level(result, "MySQL") == "familiar"
+
+
+def test_a_closer_degree_word_still_wins_when_it_is_shorter() -> None:
+    """长度只在右端并列时起作用：不等就仍然就近——离技能名越近越像在说它。"""
+    result = extract_skills("专业技能\n熟练运用 Redis，并且了解 MySQL")
+
+    assert _level(result, "Redis") == "familiar"
+    assert _level(result, "MySQL") == "basic"
+
+
+def test_each_skill_takes_the_degree_word_right_before_it() -> None:
+    """同一行两个档位词：各取各的，不做整行统一档位。"""
+    result = extract_skills("专业技能\n了解 Redis，精通 MySQL")
+
+    assert _level(result, "Redis") == "basic"
+    assert _level(result, "MySQL") == "proficient"
+
+
 def test_unknown_looking_product_names_are_reported_but_never_invented_as_skills() -> None:
     result = extract_skills("专业技能\n熟悉 Flowable 与 TransmittableThreadLocal 源码")
 

@@ -8,11 +8,15 @@ llm:
   request_timeout_seconds: 30
   max_concurrency: 16
   default_max_tokens: 2048
+  # 最坏情况 = 3 轮校验 × 3 次传输 × 30s = 270s，再加退避睡眠；240s 是"真到最坏就掐断"的位置
+  retry_deadline_seconds: 240
+  refeed_max_chars: 1200
 
 agent:
   recursion_limit: 25
   validate_max_retries: 2
   max_tokens_per_run: 200000
+  prompt_version: v1
 
 question:
   total: 15
@@ -22,3 +26,16 @@ retrieval:
   top_k_coarse: 20
   top_k_final: 5
   dedup_similarity_threshold: 0.85
+
+upload:
+  document_bytes: 5242880
+  image_bytes: 10485760
+
+# 文字层 PDF 的读取上限：超页数的在读取前拒、超字数的在拼好后拒（判据见 ParseParams）
+parse:
+  max_pdf_pages: 20
+  max_raw_chars: 60000
+
+# 僵尸任务回收阈值（分钟）：running 且 updated_at 停在这个时长之外就翻 failed
+task:
+  stale_after_minutes: 30

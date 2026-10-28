@@ -1,8 +1,8 @@
 """岗位 / 简历的写端点测试：CRUD 的接缝 + 报告列表的"哪份简历 × 哪个岗位"。
 
-夹具与 `test_m6_api.py` 同形（真 `create_app()` + 单例引擎 + `tmp_path` 里的独立库与
-上传目录），这里不复用它的 fixture：那个文件钉的是"API 与后台的接缝"，本文件钉的是
-"写路径的翻译与后果"，两边的替身需求不一样。
+夹具来自 `tests/test_api/conftest.py`（真 `create_app()` + 单例引擎 + `tmp_path` 里的独立库
+与上传目录），本文件只额外加一个 autouse fixture 把两个后台执行体换成空协程：这里测的是
+写路径的后果与事务边界，不跑任务本体。
 
 三条只在这里被测得到的事：
 
@@ -17,22 +17,17 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import interviews as interviews_api
 from app.api.v1 import resumes as resumes_api
 from app.config import get_settings
-from app.dependencies import dispose_engine, get_engine, get_sessionmaker
-from app.main import create_app
-from app.models import Base
+from app.dependencies import get_sessionmaker
 from app.models.interview import Interview
 from app.models.job import Job
 from app.models.question import Question
@@ -42,36 +37,9 @@ from app.repositories.question_repository import QuestionRepository
 from app.repositories.resume_repository import ResumeRepository
 from app.utils.db import session_scope
 
-#: 只走落盘、不真解析的最小伪 PDF（bytes 字面量必须纯 ASCII）
-PDF_BYTES = b"%PDF-1.4\n% stub body for upload staging only\n%%EOF\n"
+from ._stubs import PDF_BYTES
 
 JD_TEXT = "负责高并发 API 网关；精通 Python，熟悉 Redis；要求掌握 MySQL 索引优化"
-
-
-@pytest.fixture(autouse=True)
-def _settings_point_at_this_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = get_settings()
-    url = f"sqlite+aiosqlite:///{(tmp_path / 'crud.db').as_posix()}"
-    monkeypatch.setattr(settings, "database_url", url)
-    monkeypatch.setattr(settings, "upload_dir", tmp_path / "uploads")
-
-
-@pytest.fixture
-async def app() -> AsyncIterator[FastAPI]:
-    await dispose_engine()
-    engine = get_engine()
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield create_app()
-    await dispose_engine()
-
-
-@pytest.fixture
-async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://if.test"
-    ) as new:
-        yield new
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +48,7 @@ def _background_tasks_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
     （执行体在 `tests/test_tasks/`，接缝在 `test_m6_api.py`）。
     """
 
-    async def swallow(*args: Any) -> None:
+    async def swallow(*args: Any, **kwargs: Any) -> None:
         return None
 
     monkeypatch.setattr(interviews_api, "run_question_generation", swallow)
@@ -436,7 +404,7 @@ async def test_report_list_names_the_resume_and_the_job_it_was_generated_against
     job_id = await _create_job(client)
     interview_id = await _start_report(client, resume_id, job_id)
 
-    body = (await client.get("/api/v1/interviews/list")).json()
+    body = (await client.get("/api/v1/interviews/list")).json()["items"]
 
     assert len(body) == 1
     head = body[0]

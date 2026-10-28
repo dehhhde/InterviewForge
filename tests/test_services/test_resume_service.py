@@ -172,17 +172,56 @@ def test_a_degree_outside_the_enum_is_reported() -> None:
     assert any("枚举" in issue for issue in outcome.issues)
 
 
-def test_a_degree_word_the_alias_table_does_not_cover_is_reported_as_a_gap() -> None:
-    """`MBA` 在抽取词表里但不在别名表里，会被静默归成 other——枚举合法但信息丢了。"""
-    dirty = _RESUME.replace("某大学 本科 软件工程 2017-2021", "某大学 MBA 2017-2021")
+def test_a_degree_word_the_alias_table_does_not_cover_is_reported_as_a_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """字样在抽取词表里但不在别名表里，会被静默归成 other——枚举合法但信息丢了，必须报。
+
+    词表里现在每个字样都有归属（`MBA`/`EMBA`/`中专`/`高中` 是 T-012 补的最后几个），
+    所以这里临时抹掉一个归属来演"漏收"这一支：判据本身不能被删掉，它挡的是未来新增字样。
+    """
+    from app.services import resume_service as resume_service_module
+
+    dirty = _RESUME.replace("某大学 本科 软件工程 2017-2021", "某大学 硕士 2017-2021")
     parsed = _clean_parsed()
     parsed["educations"][0].update(
-        {"degree": "other", "evidence": "某大学 MBA 2017-2021", "major": None}
+        {"degree": "other", "evidence": "某大学 硕士 2017-2021", "major": None}
+    )
+    # 规则层 import 的是常量本身，所以要打的是服务层那个名字
+    monkeypatch.setattr(
+        resume_service_module,
+        "DEGREE_ALIASES",
+        {k: v for k, v in resume_service_module.DEGREE_ALIASES.items() if k != "硕士"},
     )
 
     outcome = _validate(dirty, parsed)
 
-    assert any("MBA" in issue and "别名表" in issue for issue in outcome.issues)
+    assert any("硕士" in issue and "别名表" in issue for issue in outcome.issues)
+
+
+@pytest.mark.parametrize(
+    ("label", "degree"),
+    [("MBA", "master"), ("EMBA", "master"), ("中专", "other"), ("高中", "other")],
+)
+def test_aliased_degree_labels_do_not_raise_an_issue(label: str, degree: str) -> None:
+    """非全日制与中等学历不再误报〔T-012〕：整条链从原文抽出来，issue 数为 0。
+
+    判据走全链路（`extract_timeline` → `ResumeSchema` → `validate_resume`），
+    因为"误报"正是这三层各认一半才出现的：词表认得、别名表不认、规则层就开口。
+    """
+    from app.extractors.timeline_extractor import extract_timeline
+
+    dirty = _RESUME.replace("某大学 本科 软件工程 2017-2021", f"某大学 {label} 2017-2021")
+    parsed = _clean_parsed()
+    timeline = extract_timeline(dirty, today=_TODAY)
+    assert timeline.educations and timeline.educations[0].degree == degree
+    parsed["educations"] = [
+        item.model_dump(mode="json") for item in timeline.educations
+    ]
+
+    outcome = _validate(dirty, parsed)
+
+    assert outcome.issues == ()
 
 
 def test_without_any_extraction_there_is_nothing_to_validate() -> None:

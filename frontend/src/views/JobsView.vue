@@ -25,10 +25,11 @@ import {
   uploadJob,
 } from '@/api'
 import { isApiFailure, writeFailureHint } from '@/api/http'
-import type { Job, JobDraft, JobPayload } from '@/api/types'
+import type { Job, JobDraft, JobListItem, JobPayload } from '@/api/types'
 import EmptyBlock from '@/components/EmptyBlock.vue'
 import JobFormDrawer from '@/components/JobFormDrawer.vue'
 import PageHeader from '@/components/PageHeader.vue'
+import { useDebouncedSearch } from '@/utils/search'
 import { shortId } from '@/utils/format'
 
 const COMMON_SKILLS = [
@@ -37,7 +38,8 @@ const COMMON_SKILLS = [
   'Linux', '分布式', '微服务', '高并发',
 ]
 
-const rows = ref<Job[]>([])
+const rows = ref<JobListItem[]>([])
+const total = ref(0)
 const loading = ref(true)
 const keyword = ref('')
 
@@ -73,21 +75,13 @@ const skillOptions = computed(() => {
   return [...pool].sort((left, right) => left.localeCompare(right, 'zh-CN'))
 })
 
-const filtered = computed(() => {
-  const term = keyword.value.trim().toLowerCase()
-  if (!term) return rows.value
-  return rows.value.filter((job) => {
-    const haystack = [job.title, job.company, job.jd_text, ...job.required_skills]
-      .join(' ')
-      .toLowerCase()
-    return haystack.includes(term)
-  })
-})
-
 async function load(): Promise<void> {
   loading.value = true
   try {
-    rows.value = await listJobs(200)
+    // 搜索打在服务端：列表行没有 `jd_text`，本地已经无从比对正文。
+    const page = await listJobs({ q: keyword.value.trim() })
+    rows.value = page.items
+    total.value = page.total
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -95,14 +89,21 @@ async function load(): Promise<void> {
   }
 }
 
+useDebouncedSearch(keyword, () => void load())
+
 function openCreate(): void {
   editingJob.value = null
   draftPayload.value = null
   drawerOpen.value = true
 }
 
-function openEdit(job: Job): void {
-  editingJob.value = job
+/**
+ * 打开编辑抽屉前先拉一次详情〔T-307〕：列表行只带 JD 摘录，
+ * 直接把行数据塞进抽屉会让正文框空着，保存一次就把原文抹掉。
+ */
+async function openEdit(jobId: string): Promise<void> {
+  await onEditExisting(jobId)
+  if (editingJob.value?.id !== jobId) return
   draftPayload.value = null
   drawerOpen.value = true
 }
@@ -122,7 +123,7 @@ async function onSaved(): Promise<void> {
   await load()
 }
 
-async function removeJob(job: Job): Promise<void> {
+async function removeJob(job: JobListItem): Promise<void> {
   try {
     await ElMessageBox.confirm(
       `删除「${job.title}${job.company ? ` · ${job.company}` : ''}」？历史报告不会跟着走——报告头里有岗位名快照。`,
@@ -286,20 +287,23 @@ onMounted(() => {
     <div class="card flush">
       <div class="card-head" style="padding: 20px 22px 0; margin-bottom: 12px">
         <div>
-          <h3>岗位列表 <span class="tiny">共 {{ rows.length }} 个</span></h3>
-          <p>点一行进入编辑；删除不会带走历史报告。</p>
+          <h3>岗位列表 <span class="tiny">共 {{ total }} 个</span></h3>
+          <p>点一行进入编辑（编辑抽屉读的是完整 JD）；删除不会带走历史报告。</p>
         </div>
         <el-input
           v-model="keyword"
-          placeholder="搜索岗位 / 公司 / 技能 / JD"
+          placeholder="搜索岗位 / 公司"
+          aria-label="搜索岗位名称或公司"
+          maxlength="64"
           clearable
           style="width: 280px"
+          @keyup.enter="load()"
         >
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
       </div>
 
-      <el-table :data="filtered" v-loading="loading" row-class-name="clickable-row" @row-click="openEdit">
+      <el-table :data="rows" v-loading="loading" row-class-name="clickable-row" @row-click="openEdit($event.id)">
         <el-table-column label="岗位" min-width="240">
           <template #default="{ row }">
             <div class="table-title">{{ row.title }}</div>
@@ -328,13 +332,13 @@ onMounted(() => {
         </el-table-column>
         <el-table-column label="JD 摘要" min-width="260">
           <template #default="{ row }">
-            <span class="jd-ellipsis">{{ row.jd_text }}</span>
+            <span class="jd-ellipsis">{{ row.jd_excerpt }}</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="150" align="right">
           <template #default="{ row }">
             <div class="table-actions">
-              <el-button text size="small" :icon="EditPen" @click.stop="openEdit(row)">
+              <el-button text size="small" :icon="EditPen" @click.stop="openEdit(row.id)">
                 编辑
               </el-button>
               <el-button
@@ -352,14 +356,14 @@ onMounted(() => {
         </el-table-column>
         <template #empty>
           <EmptyBlock
-            :title="rows.length ? '没有匹配的岗位' : '岗位库还是空的'"
+            :title="keyword.trim() ? '没有匹配的岗位' : '岗位库还是空的'"
             :description="
-              rows.length
-                ? '换一个岗位名、公司或技能关键词。'
+              keyword.trim()
+                ? '换一个岗位名或公司关键词（服务端只比对这两列，不读 JD 正文）。'
                 : '新建一个岗位、导入 JD 文件，或让模型从招聘海报识别草稿。'
             "
           >
-            <el-button v-if="!rows.length" type="primary" size="small" @click="openCreate">
+            <el-button v-if="!keyword.trim()" type="primary" size="small" @click="openCreate">
               新建岗位
             </el-button>
           </EmptyBlock>
@@ -450,7 +454,12 @@ onMounted(() => {
             <span v-if="!imageDraft.required_skills.length" class="tiny">未识别</span>
           </span>
         </div>
-        <div v-if="imageDraft.missing_required.length" class="alert-inline warn" style="margin-top: 12px">
+        <div
+          v-if="imageDraft.missing_required.length"
+          class="alert-inline warn"
+          role="alert"
+          style="margin-top: 12px"
+        >
           还缺必填字段：{{ imageDraft.missing_required.join('、') }}
         </div>
         <div v-if="imageDraft.notes.length" class="alert-inline info" style="margin-top: 10px">

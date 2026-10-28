@@ -54,7 +54,9 @@ class SectionMap:
     unknown_headers: list[str] = field(default_factory=list)
 
     def lines_of(self, name: SectionName) -> list[str]:
-        return self.sections.get(name, [])
+        """段内的行。**返回副本**：这份 `SectionMap` 现在要跨抽取器共用（T-208），
+        交出内部列表等于给任何一个抽取器"改坏别人输入"的机会。"""
+        return list(self.sections.get(name, []))
 
 
 def is_bullet(line: str) -> bool:

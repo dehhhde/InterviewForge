@@ -1,7 +1,8 @@
 """`POST /jobs/inspect-image`：图片 → 草稿这条链路的端点测试（全程离线）。
 
-夹具与 `test_crud_api.py` 同形（真 `create_app()` + `tmp_path` 里的独立库），差别只有一处：
-这里要 `app.dependency_overrides[get_llm]` 换掉 LLM 客户端——读图与补字段都要问模型，
+夹具来自 `tests/test_api/conftest.py`（真 `create_app()` + 单例引擎 + `tmp_path` 里的独立库），
+本文件只额外补一条视觉模型槽位。还有一处差别：这里要 `app.dependency_overrides[get_llm]`
+换掉 LLM 客户端——读图与补字段都要问模型，
 而替身得同时扮演视觉模型与抽取模型（`LLMClient.chat` 的 `purpose` 决定路由，两个都走
 同一个 `client`，所以一个替身按顺序吐两次回复就够）。
 
@@ -17,25 +18,21 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
 import pymupdf
 import pytest
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.dependencies import dispose_engine, get_engine, get_llm, get_sessionmaker
-from app.main import create_app
-from app.models import Base
+from app.dependencies import get_llm, get_sessionmaker
 from app.models.job import Job
 from app.utils.db import session_scope
 from app.utils.llm_client import LLMClient
+from tests.test_agents._fake_llm import FakeCompletions
 
 _VISION_MODEL = "some-vision-model"
 
@@ -53,56 +50,18 @@ _OCR_TEXT_NAME_IN_SENTENCE = (
 )
 
 
-class _FakeCompletions:
-    """替身：按顺序吐预置回复，记下每次 `create` 的 kwargs。"""
-
-    def __init__(self, replies: list[str]) -> None:
-        self.replies = replies
-        self.calls: list[dict[str, Any]] = []
-        self.chat = SimpleNamespace(completions=self)
-
-    async def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        text = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
-            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-        )
-
-
 @pytest.fixture(autouse=True)
-def _settings_point_at_this_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = get_settings()
-    url = f"sqlite+aiosqlite:///{(tmp_path / 'jobimage.db').as_posix()}"
-    monkeypatch.setattr(settings, "database_url", url)
-    monkeypatch.setattr(settings, "upload_dir", tmp_path / "uploads")
-    monkeypatch.setattr(settings, "llm_model_vision", _VISION_MODEL)
-
-
-@pytest.fixture
-async def app() -> AsyncIterator[FastAPI]:
-    await dispose_engine()
-    engine = get_engine()
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield create_app()
-    await dispose_engine()
-
-
-@pytest.fixture
-async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://if.test"
-    ) as new:
-        yield new
+def _a_vision_model_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """库与上传目录由 conftest 指好，这里只补本文件多出来的一条：视觉模型槽位。"""
+    monkeypatch.setattr(get_settings(), "llm_model_vision", _VISION_MODEL)
 
 
 async def _count(session: AsyncSession, model: type[Job]) -> int:
     return int((await session.execute(select(func.count()).select_from(model))).scalar_one())
 
 
-def _wire_llm(app: FastAPI, replies: list[str]) -> _FakeCompletions:
-    fake = _FakeCompletions(replies)
+def _wire_llm(app: FastAPI, replies: list[str]) -> FakeCompletions:
+    fake = FakeCompletions(replies)
     app.dependency_overrides[get_llm] = lambda: LLMClient(settings=get_settings(), client=fake)
     return fake
 
@@ -247,6 +206,54 @@ async def test_unreadable_image_is_422(
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "parse_vision_empty"
+
+
+async def test_spaced_latin_in_ocr_still_reaches_the_skill_dictionary(
+    app: FastAPI, client: AsyncClient, tmp_path: Path
+) -> None:
+    """模型把字母逐个加空格时（实测 `P y t h o n`），OCR 层先压回词形，技能才认得出〔T-104〕。
+
+    判据打在下游消费点上：`required_skills` 是 `match` 的输入，漏一项等于少一条缺口判定。
+    """
+    _wire_llm(
+        app,
+        [
+            "岗位名称：后端开发工程师\n"
+            "公司名称：示例科技有限公司\n"
+            "任职要求：精通 P y t h o n，熟悉 R e d i s，3-5 年工作经验"
+        ],
+    )
+
+    response = await client.post(
+        "/api/v1/jobs/inspect-image",
+        files={"file": ("jd.png", _png(tmp_path), "image/png")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert {"python", "redis"} <= set(body["required_skills"])
+    assert "P y t h o n" not in body["jd_text"], "正文里不该留下逐字空格的形状"
+
+
+async def test_blank_poster_fails_as_empty_read_not_as_meta_prose(
+    app: FastAPI, client: AsyncClient, tmp_path: Path
+) -> None:
+    """空白海报换来的是模型自己的话（实测 14 字），它不该变成 `jd_text`〔T-104 / TODO §2.6〕。
+
+    卡片给的形状是"草稿 `jd_text` 留空 + notes 记一条"，实现走的是既有失败分支
+    `parse_vision_empty`（422）：空正文的草稿存不进 `POST /jobs`（`jd_text` 有 5 字下限），
+    留一张空表单只是把失败推迟到保存那一刻。
+    """
+    fake = _wire_llm(app, ["（图片中未出现可识别的文字）"])
+
+    response = await client.post(
+        "/api/v1/jobs/inspect-image",
+        files={"file": ("jd.png", _png(tmp_path), "image/png")},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "parse_vision_empty"
+    assert len(fake.calls) == 1, "读图那一次照常花掉，但没有第二次补字段的钱"
 
 
 async def test_without_a_vision_model_it_refuses_to_guess(

@@ -8,11 +8,19 @@ llm:
   request_timeout_seconds: 60
   max_concurrency: 4
   default_max_tokens: 2048
+  # 一个逻辑调用（校验重试 × 传输重试）的墙钟总时限，与回灌时的截断字数（T-206）
+  retry_deadline_seconds: 300
+  refeed_max_chars: 1200
 
 agent:
   recursion_limit: 25
   validate_max_retries: 2
   max_tokens_per_run: 200000
+  # prompt 模板的版本目录名（app/prompts/templates/<这里>/）；换模板 = 复制目录再改这一行。
+  # v3 只在开发环境灰度：它在 v2 之上只加了一段 `<previous>`（定向重做轮把上一版的题与点名它的
+  # 批注交给分支，T-404 / ADR-0021）。真调对比（T-105）之前 production 仍钉在 v1，
+  # 这样"哪版模板变差了"仍能按 trace 归因。
+  prompt_version: v3
 
 question:
   total: 15
@@ -22,3 +30,17 @@ retrieval:
   top_k_coarse: 20
   top_k_final: 5
   dedup_similarity_threshold: 0.85
+
+# 上传上限（字节）：文档 5MB / 图片 10MB。判据与两档为什么要分开见 app/config.py 的 UploadParams
+upload:
+  document_bytes: 5242880
+  image_bytes: 10485760
+
+# 文字层 PDF 的读取上限：超页数的在读取前拒、超字数的在拼好后拒（判据见 ParseParams）
+parse:
+  max_pdf_pages: 20
+  max_raw_chars: 60000
+
+# 僵尸任务回收阈值（分钟）：running 且 updated_at 停在这个时长之外就翻 failed
+task:
+  stale_after_minutes: 30

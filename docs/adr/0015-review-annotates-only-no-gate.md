@@ -2,6 +2,10 @@
 
 日期：2026-10-24
 状态：已决定（部分取代 ADR-0010 的"质量门 / 预算用尽"两节）
+补记：2026-10-28 —— 本文件"后续影响"点名的**定向重做**已按它给的前提落地为 ADR-0021
+（授权驱动、按槽位、最多一轮的 `review → generate` 回炉边，批注装进 `GenerateJob`）。
+本文件的三条禁令（不要占比、不要阈值、不要重做次数）一字未改仍然成立，
+"一次成卷"仍是默认行为（`auto_fix=false`）。
 相关：`app/agents/nodes/review_node.py`、`app/agents/workflow.py`、`app/agents/state.py`、
 `app/services/review_service.py`、`app/tasks/question_generation.py`、`app/config.py`、
 `configs/{development,production,testing}.yaml`、`frontend/{app.js,index.html,app.css}`、

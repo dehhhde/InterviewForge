@@ -1,4 +1,14 @@
 # 测试环境：所有 LLM 调用必须被 mock，不产生真实请求（见 §10.7）
+#
+# 这份文件从 2026-10-28（T-313）起**真的被解析**：`tests/conftest.py` 在模块级设
+# `APP_ENV=testing`，所以下面每一个数都是几百条用例共同的运行期前提。
+# 在那之前它是一份"看着在生效"的配置，实际生效的一直是 development.yaml。
+# 两条随之而来的规矩：
+#   1. 用例不许靠环境的宽（想要 4 路并发就在用例里 `model_copy` 自己放大，
+#      `tests/test_parsers.py` 的三页 OCR 是样板）；
+#   2. 断"模板形状"的用例必须自己钉 `prompt_version`，不许跟着这里走
+#      （`tests/test_agents/test_match_node.py::_pin_template_version`）——
+#      这里停在 v1，而开发灰度在 v3，跟着环境读就会造出"v3 的段落没被断过却全绿"。
 app:
   name: InterviewForge-test
   env: testing
@@ -9,11 +19,15 @@ llm:
   request_timeout_seconds: 5
   max_concurrency: 2
   default_max_tokens: 256
+  # 测试环境的替身用量小、也不该让一条写坏的用例把 CI 拖到分钟级
+  retry_deadline_seconds: 60
+  refeed_max_chars: 400
 
 agent:
   recursion_limit: 10
   validate_max_retries: 1
   max_tokens_per_run: 100000  # 替身用量极小，护栏在测试里只验"存在"，不验触发
+  prompt_version: v1
 
 question:
   total: 3
@@ -23,3 +37,17 @@ retrieval:
   top_k_coarse: 5
   top_k_final: 3
   dedup_similarity_threshold: 0.85
+
+# 测试环境的上限压到 1MB/2MB：造越线用例只要 2MB 数据，不用为了触发 413 先灌 5MB
+upload:
+  document_bytes: 1048576
+  image_bytes: 2097152
+
+# 与 development 同值：上限拦的是异常输入，不是测试环境该收紧的东西
+parse:
+  max_pdf_pages: 20
+  max_raw_chars: 60000
+
+# 僵尸任务回收阈值（分钟）：running 且 updated_at 停在这个时长之外就翻 failed
+task:
+  stale_after_minutes: 30

@@ -1,8 +1,10 @@
 """岗位 DTO：读取形状 + 创建/更新的入参〔阶段 3 建壳，M6 只读列表，本次补齐 CRUD〕
 
-`JobOut` 现在把 `jd_text` 一起发出去：出题链路要在页面上显示"这份卷子按哪句 JD 出的"，
-而 `match` 的每条判定都锚在 JD 原文的逐字片段上——不给原文，页面上就只剩技能名。
-JD 本来也不算秘密：它是要发给候选人的岗位描述。
+`jd_text` 只在**详情**里发：出题链路要在页面上显示"这份卷子按哪句 JD 出的"，而 `match`
+的每条判定都锚在 JD 原文的逐字片段上——不给原文，页面上就只剩技能名。但那是 `GET /jobs/{id}`
+的事；列表页原先把整篇 JD 发给每一行（一屏几十行就是几百 KB），所以列表行改发 160 字的
+`jd_excerpt`〔T-301 / OPT-6.1〕。JD 本来也不算秘密：它是要发给候选人的岗位描述，
+这里收的是**带宽**而不是权限。
 
 创建/更新是分开的两个模型：`JobUpdateRequest` 全字段可选（部分更新），
 `JobCreateRequest` 的 `title` 与 `jd_text` 必填。`required_skills` 留空时由服务层用
@@ -12,20 +14,52 @@ JD 本来也不算秘密：它是要发给候选人的岗位描述。
 
 from __future__ import annotations
 
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-class JobOut(BaseModel):
+class JobFields(BaseModel):
+    """岗位的**列表行与详情共用**的列，字段名只在这里声明一次〔T-301〕。
+
+    列表 DTO 与详情 DTO 各写一遍是这张卡禁止的形状：加一列要改两处，漏一处就造出
+    "列表里有、详情没有"的字段，而页面会拿它当真相。
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     title: str
     company: str
-    jd_text: str
     required_skills: list[str] = Field(default_factory=list)
     min_years: float = 0.0
+
+
+#: 列表行里 JD 摘要的长度。列表页用两行夹断显示，160 字够填满还有余，再多就是白发的字节。
+JD_EXCERPT_CHARS = 160
+
+
+class JobListItem(JobFields):
+    """`GET /jobs` 的行：共用列 + JD 摘要，**不带整篇 `jd_text`**〔T-301〕。"""
+
+    #: `jd_text` 的前 `JD_EXCERPT_CHARS` 字，由 `from_row` 从同一列切出来（不是第二份真相）。
+    jd_excerpt: str = ""
+
+    @classmethod
+    def from_row(cls, row: Any) -> Self:
+        """共用列取 `JobFields` 的字段表，摘要从 `row.jd_text` 现切。
+
+        `row` 是 `Job` ORM 行，但 schema 反向 import models 会搅乱 §3 的分层方向，
+        所以按属性取而不是按类型取。
+        """
+        shared = {key: getattr(row, key) for key in JobFields.model_fields}
+        return cls(**shared, jd_excerpt=str(row.jd_text or "")[:JD_EXCERPT_CHARS])
+
+
+class JobOut(JobFields):
+    """岗位详情：共用列 + 完整 JD 原文。"""
+
+    jd_text: str
 
 
 class JobDraftOut(BaseModel):

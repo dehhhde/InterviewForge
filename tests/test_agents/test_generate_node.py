@@ -10,24 +10,25 @@ from typing import Any
 import pytest
 from langgraph.types import Overwrite
 
-from app.agents.nodes.generate_node import make_generate_item_node, make_generate_node
-from app.agents.workflow import PROMPT_VERSION_KEY, GenerateJob
-from app.config import Settings, get_settings
+from app.agents.nodes.generate_node import (
+    _messages,
+    make_generate_item_node,
+    make_generate_node,
+)
+from app.agents.workflow import PROMPT_VERSION_KEY, GenerateJob, route_after_generate
+from app.config import Settings
 from app.exceptions.base import BudgetExceededError, LLMError, ValidationFailedError
+from app.prompts.registry import get_prompt
 from app.utils.llm_client import LLMClient
-from tests.test_agents._fake_llm import FakeCompletions, prompt_block
+from tests.test_agents._fake_llm import FakeCompletions, prompt_block, slot_settings, stamp
 
 EVIDENCE = "使用 Redis 实现滑动窗口限流"
 RAW = f"项目经历\n{EVIDENCE}，QPS 从 800 提升到 2000。"
 
 
 def _settings() -> Settings:
-    """深拷贝并给三个模型槽位起三个可区分的名字，模型路由才有断言的余地。"""
-    copy = get_settings().model_copy(deep=True)
-    copy.llm_model_extract = "extract-slot"
-    copy.llm_model_generate = "generate-slot"
-    copy.llm_model_review = "review-slot"
-    return copy
+    """三个模型槽位三个可区分的名字，模型路由才有断言的余地。"""
+    return slot_settings(extract="extract-slot", generate="generate-slot", review="review-slot")
 
 
 def _plan(*counts: int) -> dict[str, Any]:
@@ -84,7 +85,7 @@ async def test_the_fanout_node_spends_no_tokens_and_bumps_the_batch() -> None:
     update = await node({"plan": _plan(2, 3), "question_batch": 0})
 
     assert update["question_batch"] == 1
-    assert update[PROMPT_VERSION_KEY] == "generate@v1"
+    assert update[PROMPT_VERSION_KEY] == stamp("generate")
     assert "批次 1" in update["errors"][0]
 
 
@@ -196,9 +197,9 @@ async def test_the_plan_item_is_what_gets_rendered_into_the_prompt() -> None:
     await node(_job(order_start=0))
 
     user = fake.user_text
-    assert prompt_block(user, "简历抽取结果")["name"] == "林可"
+    assert prompt_block(user, "resume_parsed")["name"] == "林可"
     assert "并发" in user and "hard" in user and "请出 2 道题" in user
-    assert prompt_block(user, "同批其它槽位") == [
+    assert prompt_block(user, "roster") == [
         {"topic": "存储", "difficulty": "medium", "count": 1}
     ]
 
@@ -212,6 +213,161 @@ async def test_a_broken_call_loses_one_slot_not_the_whole_run() -> None:
 
     assert "questions" not in update
     assert "本槽位 0 题" in update["errors"][0]
+
+
+# --- 定向重做轮〔T-404 / ADR-0021〕：节点挑槽位，载荷带上上一版 ---
+
+
+def _rows(*topics: str, batch: int = 1) -> list[dict[str, Any]]:
+    """按 `order_index` 0..n 造一批题：槽位归属全靠号位区间，题干写什么不重要。"""
+    return [
+        {
+            "stem": f"关于{topic}的第 {index} 道题",
+            "difficulty": "medium",
+            "source": "resume",
+            "evidence": EVIDENCE,
+            "topic": topic,
+            "batch": batch,
+            "order_index": index,
+        }
+        for index, topic in enumerate(topics)
+    ]
+
+
+async def test_the_fanout_node_replaces_only_the_named_slot() -> None:
+    """授权过的第二轮只扇被点名的档，其余题**换批次原样带走**〔ADR-0021〕。
+
+    `carried` 是这张卷子的另一半：`list_for_interview` 读最新批次，少带一档就交出一张缺页的卷。
+    """
+    node = make_generate_node()
+    plan = _plan(2, 2)
+    rows = _rows("甲", "甲", "乙", "乙")
+
+    update = await node(
+        {
+            "plan": plan,
+            "question_batch": 1,
+            "auto_fix": True,
+            "questions": rows,
+            "review_issues": [{"index": 2, "problem": "题干信息不全", "fix": "补上数据量级"}],
+        }
+    )
+
+    assert update["question_batch"] == 2
+    slots = update["fanout_slots"]
+    assert [slot["plan_item"]["topic"] for slot in slots] == ["主题2"], "只有 2-3 号位那一档被点名"
+    assert slots[0]["order_start"] == 2, "重做轮占回原号位，配额表一个字没改"
+    previous = slots[0]["previous"]
+    assert [item["stem"] for item in previous] == ["关于乙的第 2 道题", "关于乙的第 3 道题"]
+    assert previous[0]["issues"] == ["题干信息不全｜修法：补上数据量级"]
+    assert previous[1]["issues"] == []
+
+    overwrite = update["questions"]
+    assert isinstance(overwrite, Overwrite)
+    assert [(row["order_index"], row["batch"]) for row in overwrite.value] == [(0, 2), (1, 2)]
+    assert "定向重做 1 条槽位" in update["errors"][0]
+    assert "原样带走 2 题" in update["errors"][0]
+
+
+async def test_a_second_batch_without_authorization_redoes_nothing() -> None:
+    """没授权就没有重做：批次 2 也照整卷扇出、清空累积通道——一次成卷是默认形状。
+
+    这条与上一条只差一个 `auto_fix` 键。判据不能藏在批次号里（"第二批就是重做"），
+    否则同线程重放与定向重做会共用一个来路，而前者要的正是整卷重出。
+    """
+    node = make_generate_node()
+
+    update = await node(
+        {
+            "plan": _plan(2, 2),
+            "question_batch": 1,
+            "questions": _rows("甲", "甲", "乙", "乙"),
+            "review_issues": [{"index": 2, "problem": "题干信息不全"}],
+        }
+    )
+
+    assert [slot["plan_item"]["topic"] for slot in update["fanout_slots"]] == ["主题1", "主题2"]
+    assert isinstance(update["questions"], Overwrite)
+    assert update["questions"].value == []
+    assert "previous" not in update["fanout_slots"][0]
+
+
+async def test_the_first_round_declares_no_previous_for_any_slot() -> None:
+    """第一轮没有"上一版"可带：`fanout_slots` 里不出现 `previous` 键，载荷里则是空列表。
+
+    两者形状不同是有意的——通道里"这一轮不是重做"由键缺省表达，而分支读的是 `job.get(...)`，
+    那里缺键与"没有旧题"长得一模一样（AGENTS.md §3 的 T-205 教训），所以打包时必须补空。
+    """
+    update = await make_generate_node()({"plan": _plan(1, 1), "question_batch": 0})
+
+    assert all("previous" not in slot for slot in update["fanout_slots"])
+    sends = route_after_generate({**_job_state(), **update})
+    assert [dict(send.arg)["previous"] for send in sends] == [[], []]
+
+
+def _job_state() -> dict[str, Any]:
+    return {
+        "resume_id": "e" * 32,
+        "raw_text": RAW,
+        "jd_text": "需要熟悉并发与存储",
+        "parsed": {"name": "林可"},
+        "plan": _plan(1, 1),
+    }
+
+
+def test_only_the_new_template_renders_the_per_question_angles() -> None:
+    """角度进 prompt 是 v2 的内容，v1 一字未改〔T-202〕——版本化模板的意义就在这儿。
+
+    这里**显式点版本**而不是跟配置走：断的是"哪版模板消费哪个变量"这个永久事实，
+    不是"当前环境用哪版"（那条由 `stamp()` 负责，AGENTS.md §7）。
+    断的是我们自己的数据（角度值）有没有落到 prompt 里，不是模型文案。
+    """
+    angles = ["方案取舍", "规模化瓶颈"]
+    job = _job(
+        plan_item={
+            "topic": "并发",
+            "difficulty": "hard",
+            "count": 2,
+            "source": "resume",
+            "angles": angles,
+        }
+    )
+
+    rendered = {
+        version: _messages(get_prompt("generate", version=version), job, count=2)[1]["content"]
+        for version in ("v1", "v2")
+    }
+
+    assert all(angle not in rendered["v1"] for angle in angles)
+    assert all(angle in rendered["v2"] for angle in angles)
+
+
+def _fence_lines(rendered: str, tag: str) -> int:
+    """`<tag>` 开栏出现几行。数行而不是看子串：模板开头的注入声明会把标签名写在散文里讲一遍。"""
+    return sum(1 for line in rendered.splitlines() if line.strip() == f"<{tag}>")
+
+
+def test_only_the_redo_template_renders_the_previous_version() -> None:
+    """`<previous>` 是 v3 才有的段落〔T-404〕，v1/v2 一字未改——回炉那一次才有反馈可读。
+
+    显式点版本，理由与上一条相同：断的是"哪版模板消费哪个变量"这个永久事实。
+    断的是我们自己构造的旧题与批注落没落进 prompt，不是模型文案。
+    """
+    previous = [{"stem": "讲讲你的限流方案", "difficulty": "hard", "issues": ["题干信息不全"]}]
+    redo_job = _job(previous=previous)
+    first_job = _job()
+
+    rendered = {
+        version: _messages(get_prompt("generate", version=version), redo_job, count=2)[1]["content"]
+        for version in ("v2", "v3")
+    }
+
+    assert "讲讲你的限流方案" not in rendered["v2"]
+    assert _fence_lines(rendered["v2"], "previous") == 0
+    assert prompt_block(rendered["v3"], "previous") == previous
+    # 第一轮（载荷里 `previous` 为空）不渲染那段围栏：给模型看一个空段落只会引出一句道歉
+    first = _messages(get_prompt("generate", version="v3"), first_job, count=2)[1]["content"]
+    assert _fence_lines(first, "previous") == 0
 
 
 async def test_the_branch_carries_the_job_ad_into_its_prompt() -> None:

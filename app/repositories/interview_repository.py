@@ -23,6 +23,25 @@ class InterviewRepository(BaseRepository[Interview]):
         )
         return (await self.session.execute(stmt)).scalars().all()
 
+    async def get_running_for(self, resume_id: str, job_id: str) -> Interview | None:
+        """同一份简历对同一个岗位是否已有一份在跑〔T-209〕。
+
+        判据只认 `status == 'running'`：`completed` / `aborted` 都是终态，同一对
+        重跑是真实需求（改了简历要重出卷），挡掉它等于让用户排队等自己。
+        返回 `None` 表示"可以开跑"，404 之类的语义不在这里判。
+        """
+        stmt = (
+            select(Interview)
+            .where(
+                Interview.resume_id == resume_id,
+                Interview.job_id == job_id,
+                Interview.status == "running",
+            )
+            .order_by(Interview.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalars().first()
+
     async def set_status(self, id_: str, status: str) -> Interview | None:
         """收尾专用：`running` -> `completed` / `aborted`。
 

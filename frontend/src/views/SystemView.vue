@@ -16,6 +16,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import StatCard from '@/components/StatCard.vue'
 import { useAppStore } from '@/stores/app'
 import { NODE_DESCRIPTION, NODE_LABEL, PIPELINE } from '@/utils/format'
+import { POLL_INTERVAL_MS } from '@/utils/task'
 import { APP_VERSION, BUILD_TIME } from '@/utils/version'
 
 const store = useAppStore()
@@ -40,21 +41,30 @@ const browserOrigin = computed(() => location.origin)
 const endpoints = [
   { method: 'GET', path: '/api/v1/health', note: '存活探针，返回 app 与 env' },
   { method: 'POST', path: '/api/v1/resumes/upload', note: '上传简历，202 返回 resume_id + task_id' },
-  { method: 'GET', path: '/api/v1/resumes/list', note: '简历列表（含解析结果）' },
+  { method: 'GET', path: '/api/v1/resumes/list', note: '简历列表：精简行 + total，不含 parsed 正文' },
   { method: 'GET', path: '/api/v1/resumes/{id}', note: '单份简历详情' },
   { method: 'PUT', path: '/api/v1/resumes/{id}', note: '只允许改展示名 name' },
   { method: 'DELETE', path: '/api/v1/resumes/{id}', note: '名下有报告先 409，?force=true 级联删除' },
-  { method: 'GET', path: '/api/v1/jobs', note: '岗位列表' },
+  { method: 'GET', path: '/api/v1/jobs', note: '岗位列表：精简行 + total，正文只给节选' },
   { method: 'POST', path: '/api/v1/jobs', note: '新建岗位；自然键冲突返 409' },
   { method: 'POST', path: '/api/v1/jobs/upload', note: '从 txt / md / pdf / docx 导入 JD' },
   { method: 'POST', path: '/api/v1/jobs/inspect-image', note: '图片识别草稿，不落库' },
   { method: 'GET', path: '/api/v1/jobs/{id}', note: '岗位详情' },
   { method: 'PUT', path: '/api/v1/jobs/{id}', note: '更新岗位，JD 变更会重派生技能' },
   { method: 'DELETE', path: '/api/v1/jobs/{id}', note: '删除岗位，历史报告保留快照' },
-  { method: 'POST', path: '/api/v1/interviews/generate', note: '发起出题，202 返回 interview_id + task_id' },
-  { method: 'GET', path: '/api/v1/interviews/list', note: '报告列表（不含题目行）' },
+  { method: 'POST', path: '/api/v1/interviews/generate', note: '发起出题，202 返回 interview_id + task_id；auto_fix=true 时点名的档重出一轮' },
+  { method: 'GET', path: '/api/v1/interviews/list', note: '报告列表：精简行 + total，不含题目行' },
   { method: 'GET', path: '/api/v1/interviews/{id}', note: '完整报告：题目 + 批注 + 计划' },
-  { method: 'GET', path: '/api/v1/tasks/{task_id}', note: '任务进度，页面每 2 秒轮询' },
+  {
+    method: 'GET',
+    path: '/api/v1/interviews/{id}/export.md',
+    note: '服务端渲染的 Markdown 全文，带下载文件名',
+  },
+  {
+    method: 'GET',
+    path: '/api/v1/tasks/{task_id}',
+    note: `任务进度，出题页每 ${POLL_INTERVAL_MS / 1000} 秒轮询`,
+  },
 ]
 
 async function check(): Promise<void> {
@@ -160,7 +170,7 @@ onMounted(() => {
           <span>{{ store.isDark ? '暗色（localStorage 持久化）' : '亮色（localStorage 持久化）' }}</span>
         </div>
 
-        <div v-if="store.healthError" class="alert-inline bad" style="margin-top: 14px">
+        <div v-if="store.healthError" class="alert-inline bad" role="alert" style="margin-top: 14px">
           {{ store.healthError }}
         </div>
 

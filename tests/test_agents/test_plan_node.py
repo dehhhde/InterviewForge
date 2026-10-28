@@ -9,7 +9,13 @@ from typing import Any
 
 import pytest
 
-from app.agents.nodes.plan_node import DIFFICULTY_ORDER, allocate, difficulty_quotas, make_plan_node
+from app.agents.nodes.plan_node import (
+    ANGLES_BY_DIFFICULTY,
+    DIFFICULTY_ORDER,
+    allocate,
+    difficulty_quotas,
+    make_plan_node,
+)
 from app.config import DifficultyRatio, QuestionParams, Settings, get_settings
 from app.exceptions.base import ValidationFailedError
 
@@ -155,6 +161,64 @@ async def test_item_shape_carries_the_provenance_generate_needs() -> None:
         assert item["topic"] == "MySQL"
         assert item["dimension"] == "job_fit"
         assert item["rationale"]
+
+
+async def test_angles_are_part_of_the_provenance_generate_needs() -> None:
+    """每个槽位带 `angles`，长度恰好等于题数、且全部取自本档的角度池〔T-202〕。
+
+    长度相等是因为题数由配额定死（`sum(count) == total` 那条验收不能因为加角度而变），
+    取自本档是因为角度必须与难度相配——让 hard 槽位去问"名词与定义"，配额表就名存实亡。
+    """
+    node = make_plan_node(settings=_settings())
+
+    update = await node({"profile": _profile([_topic("MySQL", 1, source="resume")])})
+
+    for item in update["plan"]["items"]:
+        pool = ANGLES_BY_DIFFICULTY[item["difficulty"]]
+        assert len(item["angles"]) == item["count"]
+        assert set(item["angles"]) <= set(pool)
+        if item["count"] <= len(pool):
+            assert len(set(item["angles"])) == item["count"], "没超过池长时不许两个题同一个角度"
+
+
+def test_one_topic_three_difficulties_get_three_different_angles() -> None:
+    """这张卡要修的就是那一幕：同主题三档各写一遍"那道最经典的题"（实测 3/4 批注是换皮重复）。
+
+    用 `allocate` 直接喂 1/1/1 而不是走整个节点，是为了把形状钉在最窄的地方——
+    三个槽位、一题一档，角度仍必须互不相同。
+    """
+    items = allocate([_topic("MySQL", 1)], {"easy": 1, "medium": 1, "hard": 1})
+
+    assert [item["difficulty"] for item in items] == list(DIFFICULTY_ORDER)
+    first_angles = [item["angles"][0] for item in items]
+    assert len(set(first_angles)) == 3, first_angles
+
+
+def test_a_slot_bigger_than_the_pool_wraps_instead_of_running_dry() -> None:
+    """池用完取模，而不是给到第 4 题就没角度〔T-202〕。
+
+    取模是有意的兜底：`question_service.MAX_QUESTIONS_PER_ITEM` 封在 6，所以最坏情况
+    是第 5、6 题与第 1、2 题同角度——那时该扩池，而不是让 `len(angles) != count` 成立。
+    """
+    items = allocate([_topic("MySQL", 1)], {"easy": 0, "medium": 6, "hard": 0})
+    angles = items[0]["angles"]
+
+    pool = list(ANGLES_BY_DIFFICULTY["medium"])
+    assert len(angles) == 6 == items[0]["count"]
+    assert angles[: len(pool)] == pool
+    assert angles[len(pool) :] == pool[: len(angles) - len(pool)]
+
+
+async def test_angles_are_deterministic_like_the_rest_of_the_plan() -> None:
+    """ADR-0009 的确定性验收现在覆盖角度：同一份 profile 两次跑出逐字节相同的表。"""
+    profile = _profile([_topic(n, i) for i, n in enumerate(["MySQL", "Redis", "Kafka"], start=1)])
+    node = make_plan_node(settings=_settings())
+
+    first, second = await node({"profile": profile}), await node({"profile": profile})
+
+    assert [item["angles"] for item in first["plan"]["items"]] == [
+        item["angles"] for item in second["plan"]["items"]
+    ]
 
 
 async def test_jd_sourced_topics_keep_source_jd_and_rubric_ones_map_to_resume() -> None:

@@ -21,6 +21,9 @@ class GenerateRequest(BaseModel):
 
     resume_id: str = Field(min_length=1)
     job_id: str = Field(min_length=1)
+    #: 授权"评审点过名的档重出一遍"〔T-404 / ADR-0021〕。默认关：一次成卷是既有契约，
+    #: 而开了它最多多烧一轮扇出——花的是钱，所以必须由调用方明说，不能服务端替它决定。
+    auto_fix: bool = False
 
 
 class InterviewStartOut(BaseModel):
@@ -37,7 +40,12 @@ class ReportQuestion(QuestionSchema):
     order_index: int = 0
 
 
-class InterviewOut(BaseModel):
+class InterviewHeadFields(BaseModel):
+    """报告头的列：`interview` 表上有的都在这里，列表行与详情**共用**〔T-301 / OPT-6.1〕。
+
+    字段名只声明一次：详情模型加的是"题目行"这一份增量，而不是把十三个列再抄一遍。
+    """
+
     id: str
     resume_id: str
     job_id: str | None = None
@@ -51,6 +59,21 @@ class InterviewOut(BaseModel):
     plan: dict[str, Any] = {}
     total_questions: int = 0
     review_issues: list[dict[str, Any]] = []
-    questions: list[ReportQuestion] = []
     created_at: datetime
     updated_at: datetime
+
+
+class InterviewListItem(InterviewHeadFields):
+    """`GET /interviews/list` 的行：报告头 + 出题计划 + 批注，**没有题目行**〔T-301〕。
+
+    以前列表复用 `InterviewOut` 并把 `questions` 留空数组，于是同一个空数组同时表示
+    "这份卷子确实没题"（`aborted` 的真实状态）和"列表不下发正文"——读的人分不清，
+    而分不清的字段迟早被人当真相用（`ReportsView` 导出前必须先取一次详情就是为它打的补丁）。
+    计划与批注留在列表行里是刻意的：报告中心的展开行直接渲染它们，不再逐行请求详情。
+    """
+
+
+class InterviewOut(InterviewHeadFields):
+    """报告详情：报告头 + 该批题目。"""
+
+    questions: list[ReportQuestion] = []

@@ -8,7 +8,9 @@ PaddleOCR 在 Python 3.14 无分发，所以扫描件唯一的出路是让多模
 2. `PdfParser` 抛出 `ParseError(code="parse_scanned_image")`。
 """
 
+import asyncio
 import base64
+import re
 from pathlib import Path
 
 import pymupdf
@@ -28,6 +30,17 @@ _JPG_QUALITY = 85
 _MIN_OCR_CHARS = 20
 #: 成本护栏：扫描件正常 1-3 页，超过这个数就当异常拒绝，不给"500 页 PDF 打爆配额"开门
 _MAX_PAGES = 20
+#: 实测（2026-10-21，合成海报）视觉模型会把拉丁字母逐字加空格：`P y t h o n`、`R e d i s`，
+#: 于是 `SKILL_ALIASES` 一个都不认，草稿的 `required_skills` 只剩词典里那条中文词。
+#: 判据保守在"连续 ≥3 个单字母 token"：少了会把 "C C++"、"GPA 3.8" 这类本来正确的写法粘坏，
+#: 而且只认 ASCII 字母——中文之间的空格是版式（"技 能"），不属于这一类失真。
+#: 不跨换行：换行是版面边界，行合并另有条判据（`docs/TODO.md` §1）。
+_SPACED_LATIN_RUN_RE = re.compile(r"(?:[A-Za-z][ \t]+){2,}[A-Za-z]")
+
+
+def despace_latin(text: str) -> str:
+    """把 `P y t h o n` 压回 `Python`；同一处要连着三个以上单字母才算逐字失真。"""
+    return _SPACED_LATIN_RUN_RE.sub(lambda match: re.sub(r"[ \t]+", "", match.group(0)), text)
 
 
 class ImageParser:
@@ -41,6 +54,10 @@ class ImageParser:
                 "无法解析扫描件：未配置视觉模型，请在 .env 设置 LLM_MODEL_VISION",
                 code="parse_vision_unconfigured",
             )
+        # 记下来是自己建的还是注入的：注入的客户端归调用方管（`parse_node` 一次运行会
+        # 走好几个解析分支，谁建谁关）；自己建的那次不关，就每份扫描件攒一套连接池。
+        # 代价是"自建的那台 parser 只能用一次"——两个调用点都是一次一建，没有复用。
+        self._owns_llm = llm is None
         self._llm = llm or LLMClient(self.settings)
 
     @property
@@ -48,28 +65,48 @@ class ImageParser:
         return type(self).__name__
 
     async def parse(self, path: Path) -> ParsedDocument:
-        images = self._to_data_urls(path)
-        prompt = get_prompt("ocr")
+        try:
+            # 栅格化是 CPU 密集（open + get_pixmap + base64），20 页能把事件循环占住几百毫秒，
+            # 所以整段进 worker 线程；并发度不在这里加闸，模型侧的 `Semaphore` 才是唯一限流点。
+            images = await asyncio.to_thread(self._to_data_urls, path)
+            prompt = get_prompt("ocr")
+            total = len(images)
 
-        pages: list[str] = []
-        warnings: list[str] = []
-        for index, data_url in enumerate(images, start=1):
-            text = (await self._read_page(prompt, data_url, index, len(images))).strip()
-            if len(text) < _MIN_OCR_CHARS:
-                warnings.append(f"第 {index} 页只识别出 {len(text)} 字，可能是空白页或图像过糊")
-            pages.append(text)
+            # 每页一次往返，串行就是 N 倍延迟；gather 的结果按提交顺序排列，
+            # 页序因此与完成顺序无关——绝不靠"谁先回写完哪页"。
+            pages = list(
+                await asyncio.gather(
+                    *(
+                        self._read_page(prompt, data_url, index, total)
+                        for index, data_url in enumerate(images, start=1)
+                    )
+                )
+            )
+        finally:
+            if self._owns_llm:
+                await self._llm.aclose()
 
-        raw_text = "\n\n".join(text for text in pages if text)
+        # 逐字空格先压回来，再按字数判糊：判据要对"我们真正留下的文本"计数
+        texts = [despace_latin(text.strip()) for text in pages]
+        warnings = [
+            f"第 {index} 页只识别出 {len(text)} 字，按空白页或糊页丢弃"
+            for index, text in enumerate(texts, start=1)
+            if len(text) < _MIN_OCR_CHARS
+        ]
+        # 糊页**不进正文**：实测一张纯灰度图回的是模型自己的话（"（图片中未出现可识别的文字）"，
+        # 14 字），留着它就等于让模型的自述冒充海报内容，还会顺着 `jd_text` 进抽取与出题。
+        # 这里不用关键词黑名单去认那种措辞（那是第二套判据），只认"字数不够"这一条硬事实。
+        raw_text = "\n\n".join(text for text in texts if len(text) >= _MIN_OCR_CHARS)
         if not raw_text:
             raise ParseError(
                 "视觉模型没有读出任何文字",
                 code="parse_vision_empty",
-                details={"path": str(path), "pages": len(images)},
+                details={"path": str(path), "pages": total},
             )
 
         return ParsedDocument(
             raw_text=raw_text,
-            page_count=len(images),
+            page_count=total,
             is_scanned=True,
             # 不走 registry，没人替它署名
             parser=self.name,

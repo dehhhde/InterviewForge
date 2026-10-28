@@ -31,6 +31,7 @@ from app.extractors.timeline_extractor import DEGREE_WORDS, TimelineResult, extr
 from app.models.resume import Resume
 from app.models.task import KIND_RESUME_PARSING, Task
 from app.parsers.image_parser import IMAGE_SUFFIXES
+from app.repositories.base import keyword_filter
 from app.repositories.interview_repository import InterviewRepository
 from app.repositories.resume_repository import ResumeRepository
 from app.schemas.resume import DEGREE_ALIASES, Degree
@@ -142,7 +143,12 @@ def _check_degree_enum(fixed: dict[str, Any], issues: list[str]) -> None:
         if degree != "other":
             continue
         # 归到 other 又确实在原文里认出了字样，那是别名表的问题，不该由下游猜
-        word = next((w for w in DEGREE_WORDS if w in str(item.get("evidence", ""))), None)
+        evidence = str(item.get("evidence", ""))
+        # 拉丁字样（MBA/EMBA）大小写不敏感：证据里写 `mba` 也算认得，别为它报 issue
+        word = next(
+            (w for w in DEGREE_WORDS if w in evidence or w in evidence.upper()),
+            None,
+        )
         if word is not None and word not in DEGREE_ALIASES:
             school = str(item.get("school", ""))[:20]
             issues.append(f"{school} 的学历字样「{word}」不在别名表里，已按 other 归档，请确认")
@@ -249,9 +255,18 @@ async def fetch_resume(session: AsyncSession, resume_id: str) -> Resume | None:
 
 
 async def list_resumes(
-    session: AsyncSession, *, limit: int = 50, offset: int = 0
-) -> Sequence[Resume]:
-    return await ResumeRepository(session).list(limit=limit, offset=offset)
+    session: AsyncSession, *, limit: int = 50, offset: int = 0, q: str = ""
+) -> tuple[Sequence[Resume], int]:
+    """一页简历 + **同一条件下**的总行数〔T-303〕。
+
+    搜索列只有 `name` / `file_name`：`raw_text` 与 `parsed` 是正文，不是标识。
+    拿正文做 LIKE 会把"搜'林可'"变成"搜所有提到林可的简历"，而且 SQLite 上没有
+    全文索引，那种查询只会把整表扫一遍。
+    """
+    repository = ResumeRepository(session)
+    filters = keyword_filter(Resume, q, ("name", "file_name"))
+    rows = await repository.list(limit=limit, offset=offset, filters=filters)
+    return rows, await repository.count(filters=filters)
 
 
 async def rename_resume(session: AsyncSession, resume_id: str, name: str) -> Resume | None:

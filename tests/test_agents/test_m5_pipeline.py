@@ -5,6 +5,8 @@
 并行分支真的各自返回时才验得出来。模型仍然全程替身：断言只看结构、次数、批次。
 
 ADR-0015 之后 `review` 是终点：批注再多也不重掷 `generate`，题目一律落库。
+ADR-0021 只开一个有界的例外——调用方带 `auto_fix=true` 且第一轮有点名的题，才回一次
+`generate` 重做**被点名的那几档**（`tests/test_agents/test_m5_pipeline.py` 末尾两条）。
 """
 
 import asyncio
@@ -17,17 +19,31 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.nodes.generate_node import make_generate_item_node, make_generate_node
+from app.agents.nodes.plan_node import ANGLES_BY_DIFFICULTY
 from app.agents.nodes.review_node import make_review_node
 from app.agents.state import GRAPH_NODES, NodeName
-from app.agents.workflow import build_agent_graph, make_thread_config, open_checkpointer
-from app.config import get_settings
+from app.agents.workflow import (
+    build_agent_graph,
+    make_thread_config,
+    open_checkpointer,
+    route_after_generate,
+)
+from app.config import Settings
 from app.repositories.interview_repository import InterviewRepository
 from app.repositories.question_repository import QuestionRepository
 from app.repositories.resume_repository import ResumeRepository
 from app.services.question_service import evidence_ratio, order_questions
+from app.services.redo_service import plan_slots
 from app.utils.db import session_scope
 from app.utils.llm_client import LLMClient
-from tests.test_agents._fake_llm import FakeCompletions, prompt_block
+from tests.test_agents._fake_llm import (
+    FakeCompletions,
+    completion,
+    fenced_block,
+    prompt_block,
+    slot_settings,
+    stamp,
+)
 
 EVIDENCE = "使用 Redis 实现滑动窗口限流"
 RAW = f"项目经历\n{EVIDENCE}，QPS 从 800 提升到 2000。"
@@ -35,27 +51,24 @@ RESUME_ID = "e" * 32
 INTERVIEW_ID = "f" * 32
 
 TOPICS = ("并发", "存储", "系统设计")
+#: 手写配额表也得带角度：`plan` 节点现在恒给 `angles`，测试里的表要跟产出同形〔T-202〕
 PLAN: dict[str, Any] = {
     "items": [
-        {"topic": topic, "difficulty": "medium", "count": 1, "source": "resume"}
-        for topic in TOPICS
+        {
+            "topic": topic,
+            "difficulty": "medium",
+            "count": 1,
+            "source": "resume",
+            "angles": [ANGLES_BY_DIFFICULTY["medium"][index]],
+        }
+        for index, topic in enumerate(TOPICS)
     ],
     "total": len(TOPICS),
 }
 
 
-def _settings() -> Any:
-    copy = get_settings().model_copy(deep=True)
-    copy.llm_model_generate = "generate-slot"
-    copy.llm_model_review = "review-slot"
-    return copy
-
-
-def _completion(text: str) -> Any:
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
-        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-    )
+def _settings() -> Settings:
+    return slot_settings(generate="generate-slot", review="review-slot")
 
 
 class _TopicAwareCompletions:
@@ -77,13 +90,10 @@ class _TopicAwareCompletions:
         counted = re.search(r"请出 (\d+) 道题", user)
         topic = matched.group(1).strip() if matched else "未知"
         total = int(counted.group(1)) if counted else 1
-        # 来源跟着槽位走，引用则从 prompt 里那一块逐字抄—— jd 槽位抄简历会被闸门丢掉
+        # 来源跟着槽位走，引用则从 prompt 里 `<jd>` 围栏逐字抄—— jd 槽位抄简历会被闸门丢掉
         located = re.search(r"本题来源：(.+)", user)
         source = located.group(1).strip() if located else "resume"
-        quoted = re.search(r"岗位 JD 原文[^\n]*\n\n(.+)", user)
-        evidence = EVIDENCE
-        if source == "jd" and quoted:
-            evidence = quoted.group(1).strip()
+        evidence = fenced_block(user, "jd") if source == "jd" else EVIDENCE
         # 故意的倒序延迟：让最后一题先完成，看落库的题号会不会跟着调度跑
         await asyncio.sleep(0.01 * (len(TOPICS) - TOPICS.index(topic) if topic in TOPICS else 0))
         payload = {
@@ -101,7 +111,7 @@ class _TopicAwareCompletions:
                 for i in range(total)
             ]
         }
-        return _completion(json.dumps(payload, ensure_ascii=False))
+        return completion(json.dumps(payload, ensure_ascii=False))
 
 
 class _Fakes:
@@ -170,7 +180,7 @@ async def test_one_round_fans_out_one_call_per_slot_and_finishes(tmp_path: Any) 
     for call in fakes.generate.calls:
         user = str(call["messages"][-1]["content"])
         own = str(re.search(r"所属主题：(.+)", user).group(1).strip())
-        roster = {entry["topic"] for entry in prompt_block(user, "同批其它槽位")}
+        roster = {entry["topic"] for entry in prompt_block(user, "roster")}
         assert roster == set(TOPICS) - {own}
 
 
@@ -235,7 +245,8 @@ async def test_a_single_round_stamps_one_of_each_prompt_version(tmp_path: Any) -
 
     trace = result["trace"]
     assert [step["node"] for step in trace][5:] == ["generate", "review"]
-    assert [step.get("prompt_version") for step in trace][5:] == ["generate@v1", "review@v1"]
+    stamps = [step.get("prompt_version") for step in trace][5:]
+    assert stamps == [stamp("generate"), stamp("review")]
     assert not [note for note in result["errors"] if "覆盖批次" in note]
 
 
@@ -320,3 +331,184 @@ async def test_the_evidence_ratio_of_a_honest_batch_is_one(tmp_path: Any) -> Non
         result = await graph.ainvoke(_input(), make_thread_config("m5-7", recursion_limit=40))
 
     assert evidence_ratio(result["questions"]) == pytest.approx(1.0)
+
+
+_MIXED_PLAN: dict[str, Any] = {
+    "items": [
+        {
+            "topic": "并发",
+            "difficulty": "medium",
+            "count": 1,
+            "source": "resume",
+            "angles": ["实现原理"],
+        },
+        {
+            "topic": "存储",
+            "difficulty": "medium",
+            "count": 1,
+            "source": "jd",
+            "angles": ["动手落地"],
+        },
+        {
+            "topic": "系统设计",
+            "difficulty": "medium",
+            "count": 1,
+            "source": "generic",
+            "angles": ["配置与参数取舍"],
+        },
+    ],
+    "total": 3,
+}
+
+#: `GenerateJob` 的全部键。少一个键，分支里 `job.get(...)` 拿到 None，
+#: 和"这一档没有语料"长得一模一样（实测 2026-10-20 漏 `jd_text` → 引用率 25%）
+_JOB_KEYS = {
+    "plan_item",
+    "order_start",
+    "question_batch",
+    "raw_text",
+    "jd_text",
+    "roster",
+    "parsed",
+    "previous",
+}
+
+
+def _jobs(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """照 `generate` 节点跑完后的形状喂路由〔T-404〕：路由只打包 `fanout_slots`，不自己挑槽位。
+
+    这里手动补上那个通道而不是让路由回退去读 `plan`：回退就会造出第二个"这一轮扇给谁"
+    的出处，而定向重做轮的答案恰恰不是整卷。
+    """
+    state = {**_input(plan=plan), "question_batch": 1, "fanout_slots": plan_slots(plan)}
+    sends = route_after_generate(state)
+    assert isinstance(sends, list), "三条有配额的槽位必须各派一个分支"
+    return [dict(send.arg) for send in sends]
+
+
+def test_a_slot_carries_only_the_corpus_its_source_can_quote() -> None:
+    """扇出瘦身：语料按槽位来源取值，**键恒在**〔T-205〕。
+
+    15 题 = 15 份同样上下文，而每份里最多只有一侧原文进得了闸门（`corpora_for`）。
+    断言写成"值清空、键还在"而不是"载荷变小"，是因为键少了才是真事故：
+    分支读 `job.get("jd_text")`，缺键会让 `source=jd` 那档永远留不下引用，
+    而它看起来和"这个岗位没给 JD"完全一样。
+    """
+    resume, jd, generic = _jobs(_MIXED_PLAN)
+
+    assert [set(job) for job in (resume, jd, generic)] == [_JOB_KEYS] * 3
+    assert (resume["raw_text"], resume["jd_text"]) == (RAW, "")
+    assert (jd["raw_text"], jd["jd_text"]) == ("", _input()["jd_text"])
+    assert (generic["raw_text"], generic["jd_text"]) == (RAW, _input()["jd_text"])
+
+
+def test_the_roster_shows_which_angles_the_other_slots_already_took() -> None:
+    """`roster` 不退掉，而是把角度一起带上〔T-202〕——分支看不见兄弟分支，只能靠这张表错开。
+
+    TODO §2.3 原本问"加了 `angle` 之后 `roster` 能不能退掉"：答案是不能。退掉它等于把
+    "整批还问了哪些角度"重新变成盲区，而角度恰恰是靠"和别人的不一样"才起作用的信息。
+    """
+    resume, jd, generic = _jobs(_MIXED_PLAN)
+
+    assert [entry["angles"] for entry in resume["roster"]] == [["动手落地"], ["配置与参数取舍"]]
+    assert [entry["topic"] for entry in jd["roster"]] == ["并发", "系统设计"]
+    assert all("angles" in entry for entry in generic["roster"]), "每档都带上它打算从哪儿问"
+
+
+async def test_a_slimmed_payload_still_quotes_from_every_source(tmp_path: Any) -> None:
+    """瘦身不许掉引用率：三种来源各出一题，比例仍须是 1.0（基线 100%）。
+
+    这条是上一条的**后果**验收：载荷里清掉一份语料后，闸门在分支真正拿得到的那份里
+    必须还找得到出处。替身按 `本题来源` 决定引用抄自哪一侧，所以它复现的是真调用里
+    最贵的那种错法——`source=jd` 的题目抄简历句子，会被整题丢弃。
+    """
+    fakes = _nodes(review_replies=_CLEAN)
+    async with open_checkpointer(tmp_path / "ckpt.db") as saver:
+        graph = build_agent_graph(fakes.nodes, checkpointer=saver)
+        result = await graph.ainvoke(
+            _input(plan=_MIXED_PLAN), make_thread_config("m5-9", recursion_limit=40)
+        )
+
+    assert [q["source"] for q in order_questions(result["questions"])] == [
+        "resume",
+        "jd",
+        "generic",
+    ]
+    assert evidence_ratio(result["questions"]) == pytest.approx(1.0)
+    assert not [note for note in result["errors"] if "找不到" in note or "没给原文引用" in note]
+
+
+# --- 定向重做回路〔T-404 / ADR-0021〕---
+
+#: 点名第 2 题（`TOPICS` 里的「存储」那一档）。`FakeCompletions` 越界后一直吐最后一条，
+#: 所以第二轮评审同样点它——正好用来钉"最多一轮"那条上界。
+_NAMED_STORAGE = ['{"issues": [{"index": 1, "problem": "题干信息不全", "fix": "补上数据量级"}]}']
+
+
+def _asked_topics(fake: Any) -> list[str]:
+    """每个出题分支问的是哪一档——重做轮该只多出一条，而不是整卷再来一遍。"""
+    return [
+        str(re.search(r"所属主题：(.+)", str(call["messages"][-1]["content"])).group(1)).strip()
+        for call in fake.calls
+    ]
+
+
+async def test_an_authorized_round_redoes_only_the_slot_that_was_named(tmp_path: Any) -> None:
+    """`auto_fix=true`：整卷 3 次调用 + 重做档 1 次调用，第二批仍是完整 3 题、号位 0-2。
+
+    这条断的是回路的**形状**，不是修复效果（效果要看真模型，卡 T-105/D-2）：
+    - 只多花一条槽位的调用，没被点名的两档一题不重出；
+    - 没被点名的题原样带进新批次——`review` 读的是最新批次，少带就是交出一张缺页的卷子；
+    - 第二轮评审照样点它，但批次号已经是 2，路由回 END，**不会有第三轮**。
+    """
+    fakes = _nodes(review_replies=_NAMED_STORAGE)
+    async with open_checkpointer(tmp_path / "ckpt.db") as saver:
+        graph = build_agent_graph(fakes.nodes, checkpointer=saver)
+        result = await graph.ainvoke(
+            _input(auto_fix=True), make_thread_config("m5-10", recursion_limit=60)
+        )
+
+    ran = [step["node"] for step in result["trace"]]
+    assert ran.count(NodeName.GENERATE.value) == 2
+    assert ran.count(NodeName.REVIEW.value) == 2, "第二轮的批注不再换第三次扇出"
+    assert _asked_topics(fakes.generate).count("存储") == 2
+    assert [t for t in _asked_topics(fakes.generate) if t != "存储"] == ["并发", "系统设计"]
+    assert result["question_batch"] == 2
+
+    ordered = order_questions(result["questions"])
+    assert [q["order_index"] for q in ordered] == [0, 1, 2]
+    assert {q["batch"] for q in ordered} == {2}, "最新批次必须是完整一张卷子，不是只有被修的那一档"
+    assert [q["stem"].split("的第")[0].removeprefix("关于") for q in ordered] == list(TOPICS)
+
+
+async def test_the_redo_round_lands_one_complete_latest_batch(
+    tmp_path: Any, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    """落库这一端：报告读到的最新批次是 3 题（2 道带走 + 1 道重出），不是 1 题。
+
+    这是"缺页"事故的现场验收。上一批的行留在表里（`(interview_id, batch, order_index)`
+    各占一格），但 `list_for_interview` 默认只读最新批——计划书 §6 风险 5 的那条口径。
+    """
+    async with session_scope(db_sessionmaker) as session:
+        await ResumeRepository(session).create(id=RESUME_ID, name="林可", raw_text=RAW)
+        await InterviewRepository(session).create(
+            id=INTERVIEW_ID, resume_id=RESUME_ID, plan=PLAN, status="running"
+        )
+
+    fakes = _nodes(review_replies=_NAMED_STORAGE, sessionmaker=db_sessionmaker)
+    async with open_checkpointer(tmp_path / "ckpt.db") as saver:
+        graph = build_agent_graph(fakes.nodes, checkpointer=saver)
+        await graph.ainvoke(
+            _input(interview_id=INTERVIEW_ID, auto_fix=True),
+            make_thread_config("m5-11", recursion_limit=60),
+        )
+
+    async with db_sessionmaker() as session:
+        repo = QuestionRepository(session)
+        assert await repo.latest_batch(INTERVIEW_ID) == 2
+        latest = await repo.list_for_interview(INTERVIEW_ID)
+        assert [row.order_index for row in latest] == [0, 1, 2]
+        assert {row.batch for row in latest} == {2}
+        head = await InterviewRepository(session).get_by_id(INTERVIEW_ID)
+        assert head is not None and head.status == "completed"
+        assert head.total_questions == len(TOPICS)

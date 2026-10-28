@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal
 
-from app.extractors.base import Evidence, collapse
+from app.extractors.base import Evidence, collapse, join_wrapped_lines
 from app.extractors.sections import SectionMap, split_sections
 from app.schemas.resume import EducationItem, WorkExperience
 
@@ -31,8 +31,24 @@ _RANGE_RE = re.compile(
 #: 版式留给对齐的大空格，那就是字段边界
 _GAP_RE = re.compile(r"\s{2,}|[|｜]")
 _DAYS_PER_YEAR = 365.25
-#: 出现在某个分段里就判它是学历，否则那个分段当专业
-DEGREE_WORDS = ("大专", "专科", "本科", "学士", "硕士", "研究生", "博士", "MBA", "EMBA")
+#: 出现在某个分段里就判它是学历，否则那个分段当专业。
+#: 拉丁字样（MBA/EMBA）只走 `_LATIN_DEGREE_RE` 的词边界判据，中文字样才用子串。
+DEGREE_WORDS = (
+    "大专",
+    "专科",
+    "本科",
+    "学士",
+    "硕士",
+    "研究生",
+    "博士",
+    "MBA",
+    "EMBA",
+    "中专",
+    "高中",
+)
+#: 大小写不敏感，但两端必须是词边界：简历里 `MBA` 常挨着标点或空格，
+#: 而 `ABMATIC` 这类单词里含 `MBA` 不算学历（子串判据在拉丁字母上太松）。
+_LATIN_DEGREE_RE = re.compile(r"\b(EMBA|MBA)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -128,16 +144,23 @@ class _Scratch:
         )
 
 
-def extract_timeline(raw_text: str, *, today: date | None = None) -> TimelineResult:
-    """按栏目取带日期的行，切成工作/教育条目，再用工作区间算总年限。"""
-    resolved_today = today or date.today()
-    sections = split_sections(raw_text)
-    scratch = _Scratch(notes=list(_header_notes(sections)))
+def extract_timeline(
+    raw_text: str, *, today: date | None = None, sections: SectionMap | None = None
+) -> TimelineResult:
+    """按栏目取带日期的行，切成工作/教育条目，再用工作区间算总年限。
 
-    works, work_ranges = _collect_work(sections.lines_of("work"), scratch)
-    if sections.lines_of("work") and not work_ranges:
+    `sections` 是给调用方的省钱入口（T-208）：`split_sections` 是纯正则遍历，一次 parse
+    要喂三个抽取器，validate 回退时还要再喂一遍。省略则自切。传进来的必须是从同一份
+    `raw_text` 切出的表——栏目归属由文本决定，两条路径的产出逐字节相同。
+    """
+    resolved_today = today or date.today()
+    resolved_sections = sections if sections is not None else split_sections(raw_text)
+    scratch = _Scratch(notes=list(_header_notes(resolved_sections)))
+
+    works, work_ranges = _collect_work(resolved_sections.lines_of("work"), scratch)
+    if resolved_sections.lines_of("work") and not work_ranges:
         scratch.note("工作经历栏目里一个日期区间都没认出来，年限只能靠「经验」字样那类原文线索")
-    educations = _collect_educations(sections.lines_of("education"), scratch)
+    educations = _collect_educations(resolved_sections.lines_of("education"), scratch)
     years = _years_from_ranges(work_ranges, resolved_today, scratch)
     return TimelineResult(
         work_experiences=works,
@@ -286,14 +309,23 @@ def _header_notes(sections: SectionMap) -> list[str]:
 
 
 def _degree_word(part: str) -> str | None:
-    """分段里出现的学历字样（"本科学士"取先命中的那个），没有就当它是专业。"""
+    """分段里出现的学历字样（"本科学士"取先命中的那个），没有就当它是专业。
+
+    拉丁字样先过词边界判据：命中后统一成大写，`mba` 与 `MBA` 是同一种学历，
+    大小写不该决定它进不进别名表（`schemas/resume.py` 的 `DEGREE_ALIASES` 按大写登记）。
+    """
+    latin = _LATIN_DEGREE_RE.search(part)
+    if latin is not None:
+        return latin.group(1).upper()
     return next((word for word in DEGREE_WORDS if word in part), None)
 
 
 def _close(items: list[WorkExperience], pending: WorkExperience | None, bullets: list[str]) -> None:
     if pending is None:
         return
-    summary = "；".join(bullet for bullet in bullets if bullet) or None
+    # 这些行是"日期行之后直到下一个日期行"的正文，PDF 的换行会把一句职责劈成两半，
+    # 所以按换行连接判据拼（`join_wrapped_lines`），不再用"；"假装它们是并列条目
+    summary = join_wrapped_lines(bullets) or None
     items.append(
         pending if summary is None else pending.model_copy(update={"summary": summary})
     )

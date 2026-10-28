@@ -2,7 +2,8 @@
 
 这里要钉住的是"API 与后台的接缝"，不是后台本身（`tests/test_tasks/` 测执行体）：
 
-1. 202 回执带两个 id，且**任务函数拿到的参数**与库里那两行对得上；
+1. 202 回执带两个 id，且**任务函数拿到的参数**与库里那两行对得上（含 T-304 的 `thread_id`：
+   开跑前就落在报告行上，导出才用得上单次定位而不是扫全库）；
 2. 后台协程跑起来时业务行**已经提交**——这条在 M6 是真踩出来的：实测（FastAPI 0.143 +
    Starlette 1.8）后台在 `get_db` 收尾**之前**就执行，所以"排后台任务"的端点不能靠请求
    会话提交。验证方式只能是让替身**另开一个会话**去读：同一个会话里读得到只证明缓存，
@@ -15,7 +16,6 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +29,8 @@ from app.api.v1 import interviews as interviews_api
 from app.api.v1 import jobs as jobs_api
 from app.api.v1 import resumes as resumes_api
 from app.config import get_settings
-from app.dependencies import dispose_engine, get_engine, get_sessionmaker
+from app.dependencies import get_sessionmaker
 from app.main import create_app
-from app.models import Base
 from app.models.interview import Interview
 from app.models.resume import Resume
 from app.models.task import KIND_QUESTION_GENERATION, KIND_RESUME_PARSING, Task
@@ -42,42 +41,7 @@ from app.repositories.resume_repository import ResumeRepository
 from app.services import task_service
 from app.utils.db import session_scope
 
-#: 只走落盘、不真解析的最小伪 PDF（bytes 字面量必须纯 ASCII）
-PDF_BYTES = b"%PDF-1.4\n% stub body for upload staging only\n%%EOF\n"
-
-
-@pytest.fixture(autouse=True)
-def _settings_point_at_this_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """把两份"进程级真相"（数据库 URL、上传目录）都指到本用例的 `tmp_path`。
-
-    上传目录不隔离就会写进 `data/uploads/`——测试顺手往开发目录灌垃圾是迟早的事。
-    """
-    settings = get_settings()
-    url = f"sqlite+aiosqlite:///{(tmp_path / 'api.db').as_posix()}"
-    monkeypatch.setattr(settings, "database_url", url)
-    monkeypatch.setattr(settings, "upload_dir", tmp_path / "uploads")
-
-
-@pytest.fixture
-async def app() -> AsyncIterator[FastAPI]:
-    """真 `create_app()` + 建表：路由、依赖、异常处理器全按生产装配。
-
-    建表走 `Base.metadata.create_all`，但**引擎用单例**——另起一台就是第二个连接池
-    抢同一个 SQLite 文件，正是 AGENTS.md §3 禁止的形状。
-    """
-    await dispose_engine()
-    engine = get_engine()
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield create_app()
-    await dispose_engine()
-
-
-@pytest.fixture
-async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://if.test") as new:
-        yield new
+from ._stubs import PDF_BYTES
 
 
 async def _count(session: AsyncSession, model: type) -> int:
@@ -209,10 +173,49 @@ async def test_list_resumes_is_registered_before_the_id_route(client: AsyncClien
 
     full = await client.get("/api/v1/resumes/list")
     assert full.status_code == 200
-    assert len(full.json()) == 2
+    assert len(full.json()["items"]) == 2
 
     paged = await client.get("/api/v1/resumes/list", params={"limit": 1})
-    assert len(paged.json()) == 1
+    body = paged.json()
+    assert len(body["items"]) == 1
+    # `total` 数的是**过滤后**的总行数，不是这一页给了几条：分页控件靠它算页数。
+    # 这一条就是 `Page` 相对裸数组的全部增量，所以钉在这里而不是另开一个用例。
+    assert body["total"] == 2
+
+
+# --- 列表分页参数的区间约束 ---
+
+#: 三个列表端点共用同一对 `PageLimit`/`PageOffset`，所以三条都要过一遍：
+#: 只改一个等于把"负数绕过 LIMIT"的口子留在另外两个上。
+_LIST_PATHS = ("/api/v1/resumes/list", "/api/v1/jobs", "/api/v1/interviews/list")
+
+
+@pytest.mark.parametrize("path", _LIST_PATHS)
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("limit", -1), ("limit", 9999), ("offset", -1)],
+    ids=["limit=-1", "limit=9999", "offset=-1"],
+)
+async def test_list_endpoints_reject_out_of_range_paging(
+    client: AsyncClient, path: str, key: str, value: int
+) -> None:
+    """越界的分页参数在**进服务层之前**就 422，而不是被 SQLite 当成"返回全表"。"""
+    response = await client.get(path, params={key: value})
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "validation_failed"
+    assert {problem["loc"][-1] for problem in error["details"]["problems"]} == {key}
+
+
+@pytest.mark.parametrize("path", _LIST_PATHS)
+async def test_list_endpoints_take_the_declared_upper_bound(
+    client: AsyncClient, path: str
+) -> None:
+    """边界值本身是合法请求：挡的是越界，不是"分页到此为止"。"""
+    response = await client.get(path, params={"limit": 200, "offset": 10000})
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "total": 0}
 
 
 # --- GET /tasks/{task_id} ---
@@ -252,16 +255,111 @@ async def test_polling_sees_progress_written_by_the_background(client: AsyncClie
     assert body["progress"]["steps"] == [{"node": "parse", "ms": 12.5}]
 
 
+# --- 报告可用性派生字段（T-309 / D-6）---
+
+
+async def _completed_generation_task(*, total_questions: int) -> tuple[str, str]:
+    """造一份"任务已完成 + 报告已收尾"的组合，返回 `(task_id, interview_id)`。"""
+    resume_id = await _seed_resume()
+    job_id = await _seed_job()
+    async with session_scope(get_sessionmaker()) as session:
+        head = await InterviewRepository(session).create(
+            resume_id=resume_id, job_id=job_id, status="completed", plan={}
+        )
+        head.total_questions = total_questions
+        interview_id = head.id
+        task = await task_service.create_task(
+            session, kind=KIND_QUESTION_GENERATION, ref_id=interview_id
+        )
+        task_id = task.id
+    await task_service.mark_completed(get_sessionmaker(), task_id, result={})
+    return task_id, interview_id
+
+
+async def test_a_completed_task_with_zero_questions_reports_itself_as_degraded(
+    client: AsyncClient,
+) -> None:
+    """ADR-0015 之后 0 题也会 `completed`：不派生这个字段，客户端只能自己猜。"""
+    task_id, interview_id = await _completed_generation_task(total_questions=0)
+
+    body = (await client.get(f"/api/v1/tasks/{task_id}")).json()
+
+    assert body["status"] == "completed"
+    assert body["report_status"] == "completed"
+    assert body["question_count"] == 0
+    assert body["degraded"] is True
+    assert body["degraded_reason"] == "no_questions"
+    assert body["ref_id"] == interview_id
+
+
+async def test_a_completed_task_with_questions_is_not_degraded(client: AsyncClient) -> None:
+    task_id, _ = await _completed_generation_task(total_questions=3)
+
+    body = (await client.get(f"/api/v1/tasks/{task_id}")).json()
+
+    assert body["question_count"] == 3
+    assert body["degraded"] is False
+    assert body["degraded_reason"] is None
+
+
+async def test_a_deleted_report_is_reported_as_gone_not_as_an_empty_task(
+    client: AsyncClient,
+) -> None:
+    """删简历 `?force=true` 会连报告一起删，任务行却还在——那不是 `failed`，也不该是沉默的 0。"""
+    task_id, interview_id = await _completed_generation_task(total_questions=5)
+    async with session_scope(get_sessionmaker()) as session:
+        assert await InterviewRepository(session).delete(interview_id)
+
+    body = (await client.get(f"/api/v1/tasks/{task_id}")).json()
+
+    assert body["status"] == "completed"
+    assert body["report_status"] is None
+    assert body["question_count"] is None
+    assert body["degraded"] is True
+    assert body["degraded_reason"] == "report_gone"
+
+
+async def test_a_resume_parsing_task_carries_no_report_derivations(client: AsyncClient) -> None:
+    """简历解析任务的 `ref_id` 指向简历，没有"几道题"这回事——派生字段必须留空而不是编 0。"""
+    resume_id = await _seed_resume()
+    async with session_scope(get_sessionmaker()) as session:
+        task = await task_service.create_task(session, kind=KIND_RESUME_PARSING, ref_id=resume_id)
+        task_id = task.id
+
+    body = (await client.get(f"/api/v1/tasks/{task_id}")).json()
+
+    assert body["report_status"] is None
+    assert body["question_count"] is None
+    assert body["degraded"] is False
+
+
 # --- POST /interviews/generate ---
 
 
 async def test_generate_creates_a_running_head_and_hands_jd_text_to_the_task(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[str, str, str, str]] = []
+    calls: list[dict[str, str]] = []
 
-    async def fake_task(task_id: str, resume_id: str, interview_id: str, jd_text: str) -> None:
-        calls.append((task_id, resume_id, interview_id, jd_text))
+    async def fake_task(
+        task_id: str,
+        resume_id: str,
+        interview_id: str,
+        jd_text: str,
+        *,
+        thread_id: str,
+        auto_fix: bool,
+    ) -> None:
+        calls.append(
+            {
+                "task_id": task_id,
+                "resume_id": resume_id,
+                "interview_id": interview_id,
+                "jd_text": jd_text,
+                "thread_id": thread_id,
+                "auto_fix": auto_fix,
+            }
+        )
 
     monkeypatch.setattr(interviews_api, "run_question_generation", fake_task)
 
@@ -275,7 +373,11 @@ async def test_generate_creates_a_running_head_and_hands_jd_text_to_the_task(
     assert response.status_code == 202
     body = response.json()
     assert body["status"] == "running"
-    assert calls == [(body["task_id"], resume_id, body["interview_id"], "负责高并发的 API 网关")]
+    assert len(calls) == 1
+    assert calls[0]["task_id"] == body["task_id"]
+    assert calls[0]["resume_id"] == resume_id
+    assert calls[0]["interview_id"] == body["interview_id"]
+    assert calls[0]["jd_text"] == "负责高并发的 API 网关"
 
     async with session_scope(get_sessionmaker()) as session:
         head = await session.get(Interview, body["interview_id"])
@@ -284,6 +386,126 @@ async def test_generate_creates_a_running_head_and_hands_jd_text_to_the_task(
         assert head.resume_id == resume_id and head.job_id == job_id
         assert task is not None and task.kind == KIND_QUESTION_GENERATION
         assert task.ref_id == body["interview_id"]
+        # T-304：线程 id 在**开跑前**就落库，且递给后台的就是行上那一个——
+        # 导出与排障据此读单线程，不再扫整个 checkpoint 库。
+        assert calls[0]["thread_id"] == head.thread_id
+    assert set(head.thread_id) <= set("0123456789abcdef") and len(head.thread_id) == 32
+
+    # 每次开跑一个新线程：拿 `interview_id` 当线程 id 的写法会让第二次 `astream`
+    # **续跑**上一个线程，把上次失败留下的 pending writes 一起捡回来。
+    # 先把第一份收尾：同一对 `(resume_id, job_id)` 还在 running 时再开跑会 409（T-209）。
+    async with session_scope(get_sessionmaker()) as session:
+        await InterviewRepository(session).set_status(body["interview_id"], "completed")
+    second = await client.post(
+        "/api/v1/interviews/generate", json={"resume_id": resume_id, "job_id": job_id}
+    )
+    assert second.json()["interview_id"] != body["interview_id"]
+    assert calls[1]["thread_id"] != calls[0]["thread_id"]
+
+
+async def test_a_second_generation_for_the_same_pair_is_a_409(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一 `(resume_id, job_id)` 还在 running 时再开跑：409 带既有 `interview_id`〔T-209 / D-5〕。
+
+    判重口径选 (a) 而不是"只看简历"：换岗位重跑是主流程，挡掉它会造出假冲突。
+    这里同时钉住"没留下第二行"——409 是拒在落盘与排后台之前。
+    """
+    calls: list[dict[str, str]] = []
+
+    async def fake_task(task_id: str, *args: Any, **kwargs: Any) -> None:
+        calls.append({"task_id": task_id})
+
+    monkeypatch.setattr(interviews_api, "run_question_generation", fake_task)
+
+    resume_id = await _seed_resume()
+    job_id = await _seed_job()
+
+    first = await client.post(
+        "/api/v1/interviews/generate", json={"resume_id": resume_id, "job_id": job_id}
+    )
+    assert first.status_code == 202
+
+    second = await client.post(
+        "/api/v1/interviews/generate", json={"resume_id": resume_id, "job_id": job_id}
+    )
+
+    assert second.status_code == 409
+    error = second.json()["error"]
+    assert error["details"]["interview_id"] == first.json()["interview_id"]
+    assert error["details"]["resume_id"] == resume_id
+    assert error["details"]["job_id"] == job_id
+    assert len(calls) == 1, "被拒的那次不许再排一次后台"
+    async with session_scope(get_sessionmaker()) as session:
+        assert await _count(session, Interview) == 1
+        assert await _count(session, Task) == 1
+
+
+async def test_a_finished_report_does_not_block_the_same_pair(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终态不挡：改了简历要重出卷，这是真实需求（D-5 选 (a) 的理由之一）。"""
+
+    async def fake_task(task_id: str, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(interviews_api, "run_question_generation", fake_task)
+
+    resume_id = await _seed_resume()
+    job_id = await _seed_job()
+    first = await client.post(
+        "/api/v1/interviews/generate", json={"resume_id": resume_id, "job_id": job_id}
+    )
+    async with session_scope(get_sessionmaker()) as session:
+        await InterviewRepository(session).set_status(first.json()["interview_id"], "completed")
+
+    second = await client.post(
+        "/api/v1/interviews/generate", json={"resume_id": resume_id, "job_id": job_id}
+    )
+
+    assert second.status_code == 202
+    assert second.json()["interview_id"] != first.json()["interview_id"]
+
+
+@pytest.mark.parametrize(("body", "expected"), [({}, False), ({"auto_fix": True}, True)])
+async def test_generate_passes_the_redo_authorization_through_to_the_task(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    body: dict[str, Any],
+    expected: bool,
+) -> None:
+    """`auto_fix` 只做**翻译**，不做判断〔T-404〕：端点把请求里的布尔原样交给后台。
+
+    为什么不设服务端默认开：那一轮要多烧一次扇出（`agent.max_tokens_per_run` 量级的钱），
+    而"这次卷子要不要自动修一轮"是使用场景的决定，不是部署的决定。
+    为什么不建 `POST /interviews/{id}/redo`：定向重做要读 `raw_text` / `jd_text` 这两份语料，
+    而 ADR-0013 的报告头只存名字快照——岗位可以 `SET NULL` 下线，事后重做会拿不到出处。
+    """
+    calls: list[dict[str, Any]] = []
+
+    async def fake_task(
+        task_id: str,
+        resume_id: str,
+        interview_id: str,
+        jd_text: str,
+        *,
+        thread_id: str,
+        auto_fix: bool,
+    ) -> None:
+        calls.append({"interview_id": interview_id, "auto_fix": auto_fix})
+
+    monkeypatch.setattr(interviews_api, "run_question_generation", fake_task)
+
+    resume_id = await _seed_resume()
+    job_id = await _seed_job(jd_text="负责高并发的 API 网关")
+
+    response = await client.post(
+        "/api/v1/interviews/generate",
+        json={"resume_id": resume_id, "job_id": job_id, **body},
+    )
+
+    assert response.status_code == 202
+    assert calls == [{"interview_id": response.json()["interview_id"], "auto_fix": expected}]
 
 
 @pytest.mark.parametrize("field", ["resume_id", "job_id"])
@@ -389,7 +611,7 @@ async def test_unknown_interview_is_404(client: AsyncClient) -> None:
 
 async def test_jobs_list_exposes_the_choice_generate_needs(client: AsyncClient) -> None:
     job_id = await _seed_job(title="数据平台工程师")
-    body = (await client.get("/api/v1/jobs")).json()
+    body = (await client.get("/api/v1/jobs")).json()["items"]
     assert [job["id"] for job in body] == [job_id]
     assert body[0]["title"] == "数据平台工程师"
 

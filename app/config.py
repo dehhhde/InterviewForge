@@ -28,7 +28,10 @@ ENV_FILE = PROJECT_ROOT / ".env"
 EnvName = Literal["development", "testing", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _VALID_ENVS: tuple[str, ...] = get_args(EnvName)
-_PARAM_SECTIONS = ("llm", "agent", "question", "retrieval")
+_PARAM_SECTIONS = ("llm", "agent", "question", "retrieval", "upload", "task", "parse")
+#: `agent.prompt_version` 的合法形状：一个目录名。它要参与拼路径，所以既挡分隔符也挡
+#: `.`/`..`（首字符必须是字母或数字）——配置写错不该把模板检索变成目录穿越。
+_VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
 
 class LlmParams(BaseModel):
@@ -38,6 +41,18 @@ class LlmParams(BaseModel):
     max_concurrency: int = Field(default=4, gt=0)
     default_max_tokens: int = Field(default=2048, gt=0)
     transport_max_attempts: int = Field(default=3, ge=1, le=10)
+    #: 一次**逻辑**调用的墙钟总时限〔T-206 / BACKLOG P2「两层重试相乘」〕。
+    #: 传输重试与校验重试是两层、各管各的（AGENTS.md §3），本条不是第三层重试，
+    #: 而是给"相乘的结果"封顶：dev 最坏 3 轮校验 × 3 次传输 × `request_timeout_seconds`
+    #: ≈ 9 次 HTTP ≈ 9 分钟，而 `BackgroundTasks` 里一个卡死的分支会拖住整批题。
+    #: 300s 的取舍：明显大于一次正常往返（实测十几秒），又小于"用户还愿意等"的分钟级。
+    retry_deadline_seconds: int = Field(default=300, gt=0)
+    #: 校验重试把上一轮输出回灌进对话时截到多少字〔T-206〕。
+    #: 第 3 轮的 prompt ≈ 基础 prompt + 前两轮完整输出，`default_max_tokens=2048` 时
+    #: 一轮中文输出约 3000 字——不截就是在为"模型自己修 JSON"重复付一遍它刚写的东西。
+    #: 取 1200：结构错误（少括号、多围栏、字段名错）在前 1200 字里一定看得见，
+    #: 截断的代价只是"修不了结尾"，而那种情况本来就该由下一次重问兜。
+    refeed_max_chars: int = Field(default=1200, gt=0)
 
 
 class AgentParams(BaseModel):
@@ -49,6 +64,10 @@ class AgentParams(BaseModel):
     #: （33 次调用），默认 200k 是"正常跑不碰线、跑偏烧穿前掐断"的位置。
     #: 判定点在 `generate` 扇出之前——那是唯一"还没花出题的大钱"的时刻。
     max_tokens_per_run: int = Field(default=200_000, gt=0)
+    #: prompt 模板的版本目录名（`app/prompts/templates/<prompt_version>/`）。
+    #: trace 里的 `prompt_version` 由它决定，所以"哪版模板变差了"能归因；换模板 = 复制一个
+    #: 目录再改这里，节点代码不动。
+    prompt_version: str = Field(default="v1", pattern=_VERSION_PATTERN)
 
 
 class DifficultyRatio(BaseModel):
@@ -59,7 +78,7 @@ class DifficultyRatio(BaseModel):
     hard: float = Field(default=0.2, ge=0, le=1)
 
     @model_validator(mode="after")
-    def _check_sum(self) -> "DifficultyRatio":
+    def _check_sum(self) -> DifficultyRatio:
         total = self.easy + self.medium + self.hard
         if abs(total - 1) > 0.01:
             raise ValueError(f"difficulty_ratio 三项之和须为 1，当前 {total:.2f}")
@@ -73,6 +92,18 @@ class QuestionParams(BaseModel):
     difficulty_ratio: DifficultyRatio = Field(default_factory=DifficultyRatio)
 
 
+class TaskParams(BaseModel):
+    """僵尸任务回收的阈值，来自 yaml 的 `task:` 段（BACKLOG OPT-4.1 / T-015）。
+
+    30 分钟是**保守值而不是实测值**：`BackgroundTasks` 在同一进程里跑，进程一重启，
+    停在 `running` 的行就永远不会自己变。阈值只要明显大于最长的一次正常运行即可，
+    设小了会把还在跑的长任务误判成僵尸。而"最长一次运行"目前没有数字——
+    单页 OCR 与端到端的墙钟耗时还挂在 `docs/TODO.md` §1，那份实测出来后这个数才能收紧。
+    """
+
+    stale_after_minutes: int = Field(default=30, gt=0)
+
+
 class RetrievalParams(BaseModel):
     """向量检索的召回与去重阈值，来自 yaml 的 `retrieval:` 段。"""
 
@@ -81,10 +112,44 @@ class RetrievalParams(BaseModel):
     dedup_similarity_threshold: float = Field(default=0.85, ge=0, le=1)
 
     @model_validator(mode="after")
-    def _check_top_k(self) -> "RetrievalParams":
+    def _check_top_k(self) -> RetrievalParams:
         if self.top_k_final > self.top_k_coarse:
             raise ValueError("top_k_final 不能大于 top_k_coarse")
         return self
+
+
+class UploadParams(BaseModel):
+    """上传大小上限，来自 yaml 的 `upload:` 段（BACKLOG P0-2）。
+
+    为什么分两档而不是一个总闸：简历是页级文档（M1 实测样本 ~200KB），5MB 已经宽松；
+    招聘海报是高分辨率长图，压到 5MB 会把真样本拒掉。两者共用一个数字，就只能取大的，
+    而"文档"这条路本来不需要那么宽。
+    单位是字节而不是 MB：与 `Content-Length`、`len(data)` 同量纲，省掉一次换算出错的机会。
+    """
+
+    document_bytes: int = Field(default=5_242_880, gt=0)
+    image_bytes: int = Field(default=10_485_760, gt=0)
+
+
+class ParseParams(BaseModel):
+    """文字层 PDF 的读取上限（BACKLOG OPT-3.5 / T-208）。
+
+    为什么是"拒绝"而不是"截断"：`raw_text` 是证据链的真相源——抽取值、`evidence`、
+    评审批注都要在它里面逐字命中。截断会造出一份"库里有正文、题却引用不到后半部分"的
+    简历，而拒绝会让上传的人立刻知道要换文件。截断只在叙述送模型那一侧发生
+    （`match_node._resume_evidence` 的引用预算），那里丢的是 prompt 字数，不是真相。
+
+    为什么是两个数：页数拦的是**读取开销**（`load_page` 逐页跑，300 页要先花完这段时间），
+    字数拦的是**prompt 体积**（`ner.user.j2` / `validate.user.j2` 裸贴完整 `raw_text`，
+    每轮 validate 回退再贴一遍）。 dense 排版的 20 页能写到 6 万字，所以两个都会撞到。
+
+    默认值的参照：真简历样本 `附件简历-梁清生.pdf` 实测 2 页 / 2,817 字（2026-10-28），
+    学术型长 CV 常见 3–8 页。20 页 / 60,000 字是 7 倍余量，不是实测出来的最优值；
+    撞到它的真实样本出现时按环境放宽，不必改代码。
+    """
+
+    max_pdf_pages: int = Field(default=20, gt=0)
+    max_raw_chars: int = Field(default=60_000, gt=0)
 
 
 class _YamlSettingsSource(PydanticBaseSettingsSource):
@@ -180,9 +245,12 @@ class Settings(BaseSettings):
     agent: AgentParams = Field(default_factory=AgentParams)
     question: QuestionParams = Field(default_factory=QuestionParams)
     retrieval: RetrievalParams = Field(default_factory=RetrievalParams)
+    upload: UploadParams = Field(default_factory=UploadParams)
+    task: TaskParams = Field(default_factory=TaskParams)
+    parse: ParseParams = Field(default_factory=ParseParams)
 
     @model_validator(mode="after")
-    def _check_embedding_selection(self) -> "Settings":
+    def _check_embedding_selection(self) -> Settings:
         if self.embedding_provider and not (self.embedding_model and self.embedding_dim):
             raise ValueError("设了 EMBEDDING_PROVIDER 就要同时给 EMBEDDING_MODEL 与 EMBEDDING_DIM")
         return self

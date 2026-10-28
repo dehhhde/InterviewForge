@@ -1,19 +1,25 @@
 """契约层测试：prompt 注册表与通用装饰器。"""
 
 import logging
+import re
+from collections import Counter
+from pathlib import Path
 
 import jinja2
 import pytest
+from pydantic import ValidationError
 
 from app.agents.state import PIPELINE, NodeName
+from app.config import AgentParams, get_settings
+from app.prompts import registry
 from app.prompts.registry import (
-    DEFAULT_VERSION,
     Prompt,
     UnknownPromptError,
     available_versions,
     get_prompt,
 )
 from app.utils.decorators import log_call, request_id_var, retry
+from tests.test_agents._fake_llm import fenced_block
 
 #: 每个节点模板所需的上下文变量；节点实现时必须与此一致，改模板即改这张表。
 CONTEXT: dict[NodeName, dict[str, object]] = {
@@ -23,6 +29,9 @@ CONTEXT: dict[NodeName, dict[str, object]] = {
         "requirements_json": "[]",
         "skills_json": "[]",
         "passages_json": "[]",
+        # `match@v2` 起多一面 `<resume_evidence>` 围栏（T-203）；v1 不引用它，多传无害，
+        # 但表里必须齐——否则换成 v2 的环境会在 `StrictUndefined` 上炸，而那是模板的事不是用例的事
+        "evidence_json": "[]",
     },
     NodeName.PROFILE: {
         "rubric_json": "{}",
@@ -38,6 +47,8 @@ CONTEXT: dict[NodeName, dict[str, object]] = {
         "source": "resume",
         "topic": "分布式缓存",
         "count": 2,
+        # `generate@v2` 起多一条"每题角度"（T-202 / ADR-0019）；v1 不引用它，多传无害
+        "angles_json": "[]",
     },
     NodeName.REVIEW: {"parsed_json": "{}", "jd_text": "负责容量规划", "questions_json": "[]"},
 }
@@ -53,7 +64,7 @@ def test_every_node_has_a_renderable_template() -> None:
 
 def test_prompt_version_is_exposed_for_tracing() -> None:
     prompt = get_prompt(NodeName.PARSE)
-    assert prompt.version == DEFAULT_VERSION
+    assert prompt.version == get_settings().agent.prompt_version
     assert prompt.node == "parse"
 
 
@@ -62,7 +73,50 @@ def test_unknown_version_or_node_is_reported() -> None:
         get_prompt(NodeName.PARSE, "v999")
     with pytest.raises(UnknownPromptError, match="缺少模板"):
         get_prompt("not_a_node")
-    assert DEFAULT_VERSION in available_versions()
+    assert get_settings().agent.prompt_version in available_versions()
+
+
+def test_the_configured_prompt_version_selects_the_template_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """配置里换一个版本目录，取到的就是那一版的模板；显式传参仍然压过配置。
+
+    临时目录建在 `tmp_path` 下：版本开关的用例不该往 `app/prompts/templates/` 里塞假目录，
+    那会污染 `available_versions()`，把后面所有用例的"可用版本"断言带偏。
+    """
+    root = tmp_path / "templates"
+    for version, marker in (("v2", "第二版"), ("v3", "第三版")):
+        directory = root / version
+        directory.mkdir(parents=True)
+        system = f"{marker}系统|{{{{ profile_json }}}}"
+        user = f"{marker}用户|{{{{ total }}}}"
+        (directory / "plan.system.j2").write_text(system, encoding="utf-8")
+        (directory / "plan.user.j2").write_text(user, encoding="utf-8")
+    chosen = get_settings().model_copy(update={"agent": AgentParams(prompt_version="v2")})
+    monkeypatch.setattr(registry, "TEMPLATE_DIR", root)
+    monkeypatch.setattr(registry, "get_settings", lambda app_env=None: chosen)
+
+    from_config = get_prompt(NodeName.PLAN)
+    from_argument = get_prompt(NodeName.PLAN, "v3")
+
+    assert from_config.version == "v2"
+    assert from_config.render(profile_json="{}", total=15) == [
+        {"role": "system", "content": "第二版系统|{}"},
+        {"role": "user", "content": "第二版用户|15"},
+    ]
+    assert from_argument.version == "v3"
+    assert available_versions() == ["v2", "v3"]
+
+
+def test_prompt_version_must_be_a_single_directory_name() -> None:
+    """它要参与拼路径：`..` 与分隔符让模板检索变成目录穿越。"""
+    with pytest.raises(ValidationError):
+        AgentParams(prompt_version="../secrets")
+    with pytest.raises(ValidationError):
+        AgentParams(prompt_version="v1/v2")
+    with pytest.raises(ValidationError):
+        AgentParams(prompt_version="")
+    assert AgentParams(prompt_version="v2-beta.1").prompt_version == "v2-beta.1"
 
 
 def test_missing_context_variable_fails_instead_of_rendering_blank() -> None:
@@ -74,6 +128,45 @@ def test_missing_context_variable_fails_instead_of_rendering_blank() -> None:
 def test_enum_and_plain_string_resolve_to_same_prompt() -> None:
     assert get_prompt(NodeName.PLAN) is get_prompt("plan")
     assert isinstance(get_prompt("plan"), Prompt)
+
+
+#: 每个节点把"简历/JD/题目原文"交给模型的那一面：变量名 -> 承载它的围栏。
+#: `ocr.user.j2` 只填页码，没有文本注入面，所以不在表里。
+_UNTRUSTED: list[tuple[NodeName, str, str]] = [
+    (NodeName.PARSE, "raw_text", "resume"),
+    (NodeName.VALIDATE, "raw_text", "resume"),
+    (NodeName.MATCH, "requirements_json", "jd_requirements"),
+    (NodeName.PROFILE, "parsed_json", "resume_parsed"),
+    (NodeName.PLAN, "profile_json", "profile"),
+    (NodeName.GENERATE, "jd_text", "jd"),
+    (NodeName.REVIEW, "questions_json", "questions"),
+]
+
+_MARKER = "FENCE-MARKER-42"
+_FENCE_OPEN = re.compile(r"^<([a-z_]+)>$", re.MULTILINE)
+_FENCE_CLOSE = re.compile(r"^</([a-z_]+)>$", re.MULTILINE)
+
+
+def test_every_user_template_wraps_its_untrusted_input_in_a_fence() -> None:
+    """围栏是"这是数据、不是指令"的唯一结构标记，所以判据只看结构〔T-005 / P0-5〕
+
+    只断言"开栏与闭栏同名成对、且至少有一对"。那句不执行声明的措辞不在断言里：
+    改一个字应该只动模板，不该红一片用例。
+    """
+    for node in PIPELINE:
+        rendered = str(get_prompt(node).render(**CONTEXT[node])[-1]["content"])
+        opened = Counter(_FENCE_OPEN.findall(rendered))
+        assert opened, f"{node} 的 user 模板一个围栏都没有"
+        assert opened == Counter(_FENCE_CLOSE.findall(rendered)), (node, opened)
+
+
+def test_the_untrusted_value_renders_inside_its_fence() -> None:
+    """变量确实落在围栏**内部**：光有围栏、数据在围栏外面等于没围。"""
+    for node, key, tag in _UNTRUSTED:
+        context = dict(CONTEXT[node])
+        context[key] = _MARKER
+        rendered = str(get_prompt(node).render(**context)[-1]["content"])
+        assert _MARKER in fenced_block(rendered, tag), f"{node} 的 {key} 没落进 <{tag}> 围栏"
 
 
 @log_call

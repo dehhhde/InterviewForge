@@ -146,16 +146,6 @@ export function reportPairLabel(
   return report.job_company ? `${resume} × ${job}（${report.job_company}）` : `${resume} × ${job}`
 }
 
-export function reportFileName(report: Interview): string {
-  const resume = report.resume_name || report.resume_file_name || shortId(report.id)
-  const job = report.job_title || shortId(report.id)
-  return `面试题-${resume}-${job}.md`
-}
-
-export function issueCount(issues: ReviewIssue[] | null | undefined): number {
-  return issues?.length ?? 0
-}
-
 export function issuesByIndex(
   issues: ReviewIssue[] | null | undefined,
 ): Map<number, ReviewIssue[]> {

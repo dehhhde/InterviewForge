@@ -8,9 +8,11 @@ lifespan 收尾 `dispose_engine()`：`BackgroundTasks` 与请求共享同一进�
 这里只管池）。`get_engine()` 的单例按 URL 缓存，dispose 后下一次取用会重建，
 测试之间拿它复位是安全的。
 
-中间件只挂了 CORS。`middleware/` 里的 auth / logging / rate_limit 三个壳仍未接线：
-认证欠账在 `docs/TODO.md`（所有表都没有 `user_id`），限流按计划书 §6 风险 3 的结论
-单机先不引入。
+中间件只挂了 CORS。认证与限流的空壳已在 T-312（D-8 b）里删掉——留着只会让人以为
+"改了改就能用"，而真正的前置（所有表加 `user_id`）在 `docs/TODO.md`；限流按计划书 §6
+风险 3 的结论单机先不引入。日志的**级别与输出去向**在 lifespan 里由 `configure_logging()`
+定（T-017）；"每个请求一条带 request_id 的访问日志"仍没接，决策在 `docs/TODO.md` §2.8，
+若要接，新中间件从零写，而不是从空壳续。
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from app.api.v1 import api_router
 from app.config import Settings, get_settings
 from app.dependencies import dispose_engine, get_engine
 from app.exceptions.handlers import register_exception_handlers
+from app.utils.logging import configure_logging
 
 #: 控制台构建产物。目录不存在时不挂载——测试用 `create_app()` 反复建 app，
 #: `StaticFiles(check_dir=True)` 会因为缺目录直接抛错，把整条 API 测试拖下水。
@@ -63,6 +66,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # 日志先于引擎：`get_engine()` 若在此刻就抛错，那句报错得有地方落。
+        configure_logging()
         # 启动即建引擎：把"连接串写错"这类事故挡在第一条请求之前，而不是埋进
         # 第一个上传请求的后台任务里。
         get_engine()

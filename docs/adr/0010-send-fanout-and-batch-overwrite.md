@@ -5,6 +5,9 @@
 四行以及理由 5、6 已作废：`review` 不再拦门，批注只标注哪几题有问题，题目一律照常落库。
 **仍然有效**的部分：扇出粒度、`Overwrite` 与批次、题号在扇出前算、`GenerateJob` 载荷清单、
 引用按来源核对、两套闸门共用 `evidence_problem`、难度由槽位盖章、独立评审槽位。
+补记：2026-10-28 —— 载荷清单（下面"分支输入"那一行）由 **ADR-0021** 追加 `previous`
+（定向重做时这一档上一版的题与点名它们的批注）；批次机制同时被它唤醒，
+`question_batch` 不再恒为 1。
 相关：`app/agents/nodes/{generate_node,review_node}.py`、`app/agents/workflow.py`、
 `app/agents/state.py`、`app/services/{question_service,review_service}.py`、
 `app/prompts/templates/v1/{generate,review}.{system,user}.j2`、

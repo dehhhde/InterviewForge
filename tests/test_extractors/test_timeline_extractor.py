@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from app.extractors.base import squeeze
 from app.extractors.timeline_extractor import extract_timeline, parse_range
 from app.parsers.pdf_parser import PdfParser
 
@@ -63,10 +64,28 @@ def test_only_dated_lines_open_a_work_entry_and_the_rest_become_summary() -> Non
 
     assert [w.company for w in result.work_experiences] == ["甲公司", "乙公司"]
     assert [w.role for w in result.work_experiences] == ["后端开发", "架构师"]
-    assert result.work_experiences[0].summary == "负责订单域接口；带过 3 个人"
+    assert result.work_experiences[0].summary == "负责订单域接口 带过 3 个人"
     assert result.work_experiences[1].end is None, "在职不等于没抽到日期"
     assert result.years_experience is not None
     assert float(result.years_experience.value) == pytest.approx(4.0, abs=0.1)
+
+
+def test_a_wrapped_line_is_not_cut_in_the_middle_by_a_semicolon() -> None:
+    """PDF 把"市场推广"拆成两行时，摘要只能补空格；补"；"会造出一个原文没有的话题边界。"""
+    raw = "\n".join(
+        [
+            "工作经历",
+            "甲公司 后端开发 2020.01-2022.03",
+            "完成会议记录app并支持导出，成功验收交给市场部推",
+            "广",
+        ]
+    )
+
+    summary = extract_timeline(raw, today=date(2024, 1, 1)).work_experiences[0].summary
+
+    assert summary == "完成会议记录app并支持导出，成功验收交给市场部推 广"
+    # 结构判据：分号只能出现在原文有分号的地方
+    assert squeeze(summary or "") == squeeze("完成会议记录app并支持导出，成功验收交给市场部推\n广")
 
 
 def test_a_reversed_range_is_dropped_with_a_note_instead_of_being_silently_fixed() -> None:
@@ -118,6 +137,39 @@ def test_an_education_line_without_a_degree_word_falls_back_to_other() -> None:
     assert result.educations[0].major == "计算机"
 
 
+@pytest.mark.parametrize("head", ["某大学 MBA 2017-2021", "某大学 mba 2017-2021"])
+def test_latin_degree_aliases_map_to_master_regardless_of_case(head: str) -> None:
+    """`MBA`/`mba` 都是硕士〔T-012〕。
+
+    大小写决定档位的后果是"非全日制学位"被归成 other 并让校验层报 issue，
+    而这条错误本来只是别名表漏收。
+    """
+    result = extract_timeline(f"教育经历\n{head}")
+
+    assert result.educations[0].degree == "master"
+    assert result.educations[0].major is None
+
+
+def test_a_word_that_happens_to_contain_mba_is_not_a_degree() -> None:
+    """拉丁字样只认词边界：`ABMATIC` 里的 `MBA` 不算学历，那一分段仍然当专业。"""
+    result = extract_timeline("教育经历\n某大学 ABMATIC 工程 2018-2022")
+
+    assert result.educations[0].degree == "other"
+    assert result.educations[0].major == "ABMATIC"
+
+
+@pytest.mark.parametrize(
+    ("label", "degree"),
+    [("EMBA", "master"), ("中专", "other"), ("高中", "other")],
+)
+def test_the_added_education_labels_are_recognised(label: str, degree: str) -> None:
+    """`EMBA`/`中专`/`高中` 有归属：认得出来，而不是当专业名 or 触发误报〔T-012〕。"""
+    result = extract_timeline(f"教育经历\n某学校 {label} 2018-2022")
+
+    assert result.educations[0].degree == degree
+    assert result.educations[0].major is None
+
+
 def test_resume_fields_are_dumped_ready_for_the_schema() -> None:
     result = extract_timeline("工作经历\n甲公司 后端开发 2020.01-2022.03")
 
@@ -138,3 +190,21 @@ def test_the_real_resume_yields_one_job_one_degree_and_a_computed_year_count() -
     assert result.years_experience is not None
     assert float(result.years_experience.value) == pytest.approx(2.1, abs=0.1)
     assert result.notes == ()
+
+
+def test_the_real_resume_summary_invents_no_punctuation() -> None:
+    """T-102 的验收：摘要里每一个字都能回到原文。
+
+    改之前这里是"成功验收交给市场部推；广"与"成功推动web端、；app端"——分号是连接符
+    造的，不是简历有的。断言只用结构（抹掉空白后是否整段命中原文），不钉文案。
+    """
+    raw = _resume_text()
+    haystack = squeeze(raw)
+    summaries = [
+        work.summary for work in extract_timeline(raw, today=date(2026, 10, 16)).work_experiences
+    ]
+
+    assert all(summary for summary in summaries), "这份工作有正文，摘要不该是空"
+    for summary in summaries:
+        assert squeeze(summary or "") in haystack
+        assert "；" not in squeeze(summary or "") or "；" in raw

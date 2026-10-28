@@ -16,7 +16,7 @@ from app.agents.workflow import build_agent_graph, make_thread_config, open_chec
 from app.config import get_settings
 from app.utils.llm_client import LLMClient
 
-from ._fake_llm import FakeCompletions
+from ._fake_llm import FakeCompletions, stamp
 
 _JD = """岗位职责：
 1. 负责订单服务的开发与维护
@@ -156,6 +156,6 @@ async def test_prompt_versions_of_the_two_llm_nodes_land_in_trace(tmp_path: Any)
 
     steps = {step["node"]: step for step in result["trace"]}
     assert [step["node"] for step in result["trace"]] == [name.value for name in PIPELINE]
-    assert steps[NodeName.MATCH.value]["prompt_version"] == "match@v1"
-    assert steps[NodeName.PROFILE.value]["prompt_version"] == "profile@v1"
+    assert steps[NodeName.MATCH.value]["prompt_version"] == stamp("match")
+    assert steps[NodeName.PROFILE.value]["prompt_version"] == stamp("profile")
     assert "prompt_version" not in steps[NodeName.PLAN.value], "plan 不调模型，没有版本号可记"

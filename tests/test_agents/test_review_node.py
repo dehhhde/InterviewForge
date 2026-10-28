@@ -15,14 +15,14 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.nodes.review_node import make_review_node
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.exceptions.base import LLMError, ValidationFailedError
 from app.repositories.interview_repository import InterviewRepository
 from app.repositories.question_repository import QuestionRepository
 from app.repositories.resume_repository import ResumeRepository
 from app.utils.db import session_scope
 from app.utils.llm_client import LLMClient
-from tests.test_agents._fake_llm import FakeCompletions
+from tests.test_agents._fake_llm import FakeCompletions, slot_settings, stamp
 
 EVIDENCE = "使用 Redis 实现滑动窗口限流"
 RAW = f"项目经历\n{EVIDENCE}，QPS 从 800 提升到 2000。"
@@ -31,10 +31,7 @@ RESUME_ID = "d" * 32
 
 
 def _settings() -> Settings:
-    copy = get_settings().model_copy(deep=True)
-    copy.llm_model_review = "review-slot"
-    copy.llm_model_generate = "generate-slot"
-    return copy
+    return slot_settings(review="review-slot", generate="generate-slot")
 
 
 def _question(index: int, *, batch: int = 1, **overrides: Any) -> dict[str, Any]:
@@ -88,7 +85,7 @@ async def test_a_clean_batch_finishes_and_records_the_template_version() -> None
 
     assert update["finished"] is True
     assert update["review_issues"] == []
-    assert update["prompt_version"] == "review@v1"
+    assert update["prompt_version"] == stamp("review")
     assert len(fake.calls) == 1
     assert fake.calls[0]["model"] == "review-slot", "评审走独立槽位，不与出题混用"
     assert fake.calls[0]["temperature"] == pytest.approx(0.0)

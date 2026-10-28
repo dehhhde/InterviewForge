@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   ElMessage,
   ElMessageBox,
@@ -17,15 +17,17 @@ import {
   uploadResume,
 } from '@/api'
 import { isApiFailure, writeFailureHint } from '@/api/http'
-import type { Resume, Task } from '@/api/types'
+import type { Resume, ResumeListItem, Task } from '@/api/types'
 import EmptyBlock from '@/components/EmptyBlock.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import ResumeProfile from '@/components/ResumeProfile.vue'
 import TaskTimeline from '@/components/TaskTimeline.vue'
 import { createTaskPoller } from '@/utils/task'
+import { useDebouncedSearch } from '@/utils/search'
 import { formatDateTime, initials, resumeLabel, shortId } from '@/utils/format'
 
-const rows = ref<Resume[]>([])
+const rows = ref<ResumeListItem[]>([])
+const total = ref(0)
 const loading = ref(true)
 const keyword = ref('')
 
@@ -43,7 +45,7 @@ const detail = ref<Resume | null>(null)
 const detailLoading = ref(false)
 
 const renameOpen = ref(false)
-const renameTarget = ref<Resume | null>(null)
+const renameTarget = ref<ResumeListItem | Resume | null>(null)
 const renameName = ref('')
 const renaming = ref(false)
 
@@ -51,27 +53,22 @@ const deletingId = ref('')
 
 const uploadPoller = createTaskPoller()
 
-const filtered = computed(() => {
-  const term = keyword.value.trim().toLowerCase()
-  if (!term) return rows.value
-  return rows.value.filter((resume) => {
-    const haystack = [resumeLabel(resume), resume.file_name, resume.parsed.name ?? '']
-      .join(' ')
-      .toLowerCase()
-    return haystack.includes(term)
-  })
-})
-
 async function load(): Promise<void> {
   loading.value = true
   try {
-    rows.value = await listResumes(200)
+    // 搜索打在服务端（`q`），所以这里没有 `filtered`：本页行就是"符合条件的第 1 页"。
+    const page = await listResumes({ q: keyword.value.trim() })
+    rows.value = page.items
+    total.value = page.total
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
     loading.value = false
   }
 }
+
+// 关键词框驱动服务端搜索：并段后再发请求，别每敲一个字拉一次全表。
+useDebouncedSearch(keyword, () => void load())
 
 function onFileChange(file: UploadFile): void {
   uploadFile.value = file.raw ?? null
@@ -147,7 +144,7 @@ async function openDetail(id: string): Promise<void> {
   }
 }
 
-function openRename(resume: Resume): void {
+function openRename(resume: ResumeListItem | Resume): void {
   renameTarget.value = resume
   renameName.value = resumeLabel(resume)
   renameOpen.value = true
@@ -173,7 +170,7 @@ async function submitRename(): Promise<void> {
   }
 }
 
-async function removeResume(resume: Resume): Promise<void> {
+async function removeResume(resume: ResumeListItem | Resume): Promise<void> {
   const label = resumeLabel(resume)
   try {
     await ElMessageBox.confirm(
@@ -271,7 +268,12 @@ onBeforeUnmount(() => {
               :started-at="uploadStartedAt"
               :finished-at="uploadFinishedAt"
             />
-            <div v-if="uploadTask.status === 'failed'" class="alert-inline bad" style="margin-top: 12px">
+            <div
+              v-if="uploadTask.status === 'failed'"
+              class="alert-inline bad"
+              role="alert"
+              style="margin-top: 12px"
+            >
               {{ uploadTask.error.code }}：{{ uploadTask.error.message }}
             </div>
           </template>
@@ -300,20 +302,23 @@ onBeforeUnmount(() => {
     <div class="card flush">
       <div class="card-head" style="padding: 20px 22px 0; margin-bottom: 12px">
         <div>
-          <h3>简历列表 <span class="tiny">共 {{ rows.length }} 份</span></h3>
+          <h3>简历列表 <span class="tiny">共 {{ total }} 份</span></h3>
           <p>点一行查看抽取画像；改名只动展示名；删除按报告数量决定是否需要二次授权。</p>
         </div>
         <el-input
           v-model="keyword"
           placeholder="搜索姓名 / 文件名"
+          aria-label="搜索简历姓名或文件名"
+          maxlength="64"
           clearable
           style="width: 240px"
+          @keyup.enter="load()"
         >
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
       </div>
 
-      <el-table :data="filtered" v-loading="loading" row-class-name="clickable-row" @row-click="openDetail($event.id)">
+      <el-table :data="rows" v-loading="loading" row-class-name="clickable-row" @row-click="openDetail($event.id)">
         <el-table-column label="简历" min-width="280">
           <template #default="{ row }">
             <div class="resume-cell">
@@ -328,12 +333,12 @@ onBeforeUnmount(() => {
         <el-table-column label="抽取概览" min-width="240">
           <template #default="{ row }">
             <div class="chip-row">
-              <span class="skill-chip"><b>{{ row.parsed.skills?.length ?? 0 }}</b> 技能</span>
+              <span class="skill-chip"><b>{{ row.overview.skill_count }}</b> 技能</span>
               <span class="skill-chip">
-                <b>{{ row.parsed.years_experience ?? '—' }}</b> 年经验
+                <b>{{ row.overview.years_experience ?? '—' }}</b> 年经验
               </span>
               <span class="skill-chip">
-                <b>{{ row.parsed.work_experiences?.length ?? 0 }}</b> 段工作
+                <b>{{ row.overview.work_experience_count }}</b> 段工作
               </span>
             </div>
           </template>
@@ -364,10 +369,10 @@ onBeforeUnmount(() => {
         </el-table-column>
         <template #empty>
           <EmptyBlock
-            :title="rows.length ? '没有匹配的简历' : '还没有简历'"
+            :title="keyword.trim() ? '没有匹配的简历' : '还没有简历'"
             :description="
-              rows.length
-                ? '换一个姓名或文件名关键词。'
+              keyword.trim()
+                ? '换一个姓名或文件名关键词（搜索在服务端只比对姓名与文件名）。'
                 : '拖一份 PDF 或 DOCX 到上面的上传区，解析完成后就能在这里看到结构化画像。'
             "
           />
